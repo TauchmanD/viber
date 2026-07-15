@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Tmux Agent Grid
+Comment=Tiled persistent terminals and coding agents
+Exec=/home/denis/.local/bin/tmux-agent-grid
+Icon=tmux-agent-grid
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true
+StartupWMClass=tmux-agent-grid

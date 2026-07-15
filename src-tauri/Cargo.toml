@@ -1,0 +1,22 @@
+[package]
+name = "tmux-agent-grid"
+version = "0.2.0"
+description = "Native tiled workspaces for terminals and coding agents"
+authors = ["Denis"]
+edition = "2021"
+
+[lib]
+name = "tmux_agent_grid_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dirs = "6"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+uuid = { version = "1", features = ["v4"] }

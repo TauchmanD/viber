@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <title>Tmux Agent Grid</title>
+    <link rel="stylesheet" href="./vendor/xterm.css">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">›_</span>
+          <span id="workspace-title">Agent Grid</span>
+        </div>
+        <div class="topbar-actions">
+          <div class="grid-controls" aria-label="Tiling layout">
+            <button id="auto-grid-button" class="grid-mode-button active" title="Retile automatically">Auto tile</button>
+            <button id="fewer-columns-button" class="icon-button" title="Fewer columns">−</button>
+            <output id="column-count" title="Target columns">Auto</output>
+            <button id="more-columns-button" class="icon-button" title="More columns">＋</button>
+          </div>
+          <button id="refresh-button" class="button ghost">Refresh</button>
+          <button id="new-window-button" class="button primary" disabled><span>＋</span> New window</button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="sidebar">
+          <section class="sidebar-section projects-section">
+            <div class="sidebar-heading">
+              <span>Projects</span>
+              <button id="new-project-button" class="sidebar-add" title="New project">＋</button>
+            </div>
+            <nav id="project-list" class="project-list" aria-label="Projects"></nav>
+          </section>
+          <section class="sidebar-section windows-section">
+            <div class="sidebar-heading">
+              <span>Windows</span>
+              <span id="window-count" class="count">0</span>
+            </div>
+            <nav id="window-list" class="agent-list" aria-label="Terminal windows"></nav>
+          </section>
+          <div class="sidebar-footer">
+            <span class="status-dot healthy"></span>
+            Native · tmux persistent
+          </div>
+        </aside>
+        <main id="terminal-grid" class="terminal-grid" aria-live="polite"></main>
+      </div>
+    </div>
+
+    <dialog id="project-dialog" class="modal">
+      <form id="project-form" method="dialog">
+        <div class="modal-header">
+          <div><p class="eyebrow">New workspace</p><h2>Create a project</h2></div>
+          <button type="button" class="icon-button dialog-close" aria-label="Close">×</button>
+        </div>
+        <label>
+          <span>Name</span>
+          <input id="project-name" name="name" value="Project" maxlength="60" required autocomplete="off">
+        </label>
+        <label>
+          <span>Project directory</span>
+          <span class="path-input">
+            <input id="project-cwd" name="cwd" required spellcheck="false">
+            <button type="button" class="button browse-button" data-browse="project-cwd">Browse…</button>
+          </span>
+        </label>
+        <label>
+          <span>Default agent command</span>
+          <input id="project-command" name="defaultCommand" value="codex" required spellcheck="false">
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="button ghost dialog-close">Cancel</button>
+          <button type="submit" id="create-project-button" class="button primary">Create project</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="window-dialog" class="modal">
+      <form id="window-form" method="dialog">
+        <div class="modal-header">
+          <div><p class="eyebrow">New window</p><h2>Open in this project</h2></div>
+          <button type="button" class="icon-button dialog-close" aria-label="Close">×</button>
+        </div>
+        <div class="kind-picker" role="radiogroup" aria-label="Window type">
+          <button type="button" class="kind-option active" data-kind="agent">
+            <span class="kind-icon">◆</span><span><strong>Coding agent</strong><small>Start a command such as Codex</small></span>
+          </button>
+          <button type="button" class="kind-option" data-kind="terminal">
+            <span class="kind-icon">›_</span><span><strong>Terminal</strong><small>Open a normal interactive shell</small></span>
+          </button>
+        </div>
+        <label>
+          <span>Name</span>
+          <input id="window-name" name="name" value="Agent" maxlength="60" required autocomplete="off">
+        </label>
+        <label>
+          <span>Working directory</span>
+          <span class="path-input">
+            <input id="window-cwd" name="cwd" required spellcheck="false">
+            <button type="button" class="button browse-button" data-browse="window-cwd">Browse…</button>
+          </span>
+        </label>
+        <label id="command-field">
+          <span>Command</span>
+          <input id="window-command" name="command" value="codex" spellcheck="false">
+          <small>Examples: codex, claude, opencode</small>
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="button ghost dialog-close">Cancel</button>
+          <button type="submit" id="spawn-button" class="button primary">Open window</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="./vendor/xterm.js"></script>
+    <script src="./vendor/addon-fit.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

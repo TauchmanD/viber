@@ -1,0 +1,25 @@
+{
+  "name": "tmux-agent-grid",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "A lightweight native Tauri UI for persistent terminals and coding agents in tmux.",
+  "scripts": {
+    "vendor": "node scripts/copy-vendor.mjs",
+    "dev": "npm run vendor && tauri dev",
+    "build": "npm run vendor && tauri build",
+    "check": "node --check public/app.js && cargo check --manifest-path src-tauri/Cargo.toml",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "tauri": "tauri"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
