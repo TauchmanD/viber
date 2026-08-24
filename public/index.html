@@ -12,18 +12,22 @@
     <div class="app-shell">
       <header class="topbar">
         <div class="brand">
+          <button id="compact-menu-button" class="icon-button topbar-icon compact-only" aria-label="Open project menu" title="Projects">☰</button>
           <span class="brand-mark" aria-hidden="true">›_</span>
           <span id="workspace-title">Agent Grid</span>
         </div>
         <div class="topbar-actions">
+          <button id="compact-mode-button" class="icon-button topbar-icon" aria-label="Enter compact view" aria-pressed="false" title="Compact view">▯</button>
+          <button id="settings-button" class="icon-button topbar-icon" aria-label="Open settings" title="Settings">⚙</button>
           <div class="grid-controls" aria-label="Tiling layout">
-            <button id="auto-grid-button" class="grid-mode-button active" title="Retile automatically">Auto tile</button>
+            <button id="auto-grid-button" class="grid-mode-button active" aria-label="Retile automatically" title="Retile automatically">⊞</button>
             <button id="fewer-columns-button" class="icon-button" title="Fewer columns">−</button>
             <output id="column-count" title="Target columns">Auto</output>
             <button id="more-columns-button" class="icon-button" title="More columns">＋</button>
           </div>
-          <button id="refresh-button" class="button ghost">Refresh</button>
-          <button id="new-window-button" class="button primary" disabled><span>＋</span> New window</button>
+          <button id="activity-button" class="icon-button topbar-icon" aria-label="Open activity timeline" title="Activity">◷</button>
+          <button id="refresh-button" class="icon-button topbar-icon" aria-label="Refresh projects" title="Refresh">↻</button>
+          <button id="new-window-button" class="icon-button topbar-icon primary" aria-label="New window" title="New window" disabled>＋</button>
         </div>
       </header>
 
@@ -36,6 +40,14 @@
             </div>
             <nav id="project-list" class="project-list" aria-label="Projects"></nav>
           </section>
+          <div
+            id="sidebar-section-resizer"
+            class="sidebar-resizer sidebar-section-resizer"
+            role="separator"
+            aria-label="Resize project and window lists"
+            aria-orientation="horizontal"
+            tabindex="0"
+          ></div>
           <section class="sidebar-section windows-section">
             <div class="sidebar-heading">
               <span>Windows</span>
@@ -48,14 +60,52 @@
             Native · tmux persistent
           </div>
         </aside>
+        <div
+          id="sidebar-width-resizer"
+          class="sidebar-resizer sidebar-width-resizer"
+          role="separator"
+          aria-label="Resize project sidebar"
+          aria-orientation="vertical"
+          aria-valuemin="210"
+          aria-valuemax="420"
+          tabindex="0"
+        ></div>
         <main id="terminal-grid" class="terminal-grid" aria-live="polite"></main>
+        <aside id="activity-panel" class="activity-panel" aria-label="Window activity" aria-hidden="true">
+          <div class="activity-panel-header">
+            <div>
+              <p class="eyebrow">Timeline</p>
+              <h2 id="activity-panel-title">Activity</h2>
+            </div>
+            <button id="close-activity-button" class="icon-button" title="Close activity panel">×</button>
+          </div>
+          <div id="activity-panel-ports" class="activity-panel-ports"></div>
+          <div id="activity-filters" class="activity-filters" role="group" aria-label="Timeline filters">
+            <button class="active" data-timeline-filter="all">All</button>
+            <button data-timeline-filter="interaction">Prompts</button>
+            <button data-timeline-filter="activity">Activity</button>
+            <button data-timeline-filter="port">Ports</button>
+            <button data-timeline-filter="handoff">Handoffs</button>
+          </div>
+          <div id="activity-timeline" class="activity-timeline"></div>
+        </aside>
+        <div id="compact-drawer-backdrop" class="compact-drawer-backdrop" hidden></div>
+        <aside id="compact-drawer" class="compact-drawer" aria-label="Compact navigation" hidden>
+          <div class="compact-drawer-header">
+            <strong>Projects</strong>
+            <button id="close-compact-menu-button" class="icon-button" aria-label="Close project menu">×</button>
+          </div>
+          <nav id="compact-project-list" class="compact-nav-list" aria-label="Projects"></nav>
+          <div class="compact-drawer-heading">Chats</div>
+          <nav id="compact-window-list" class="compact-nav-list" aria-label="Chats"></nav>
+        </aside>
       </div>
     </div>
 
     <dialog id="project-dialog" class="modal">
       <form id="project-form" method="dialog">
         <div class="modal-header">
-          <div><p class="eyebrow">New workspace</p><h2>Create a project</h2></div>
+          <div><p id="project-dialog-eyebrow" class="eyebrow">New workspace</p><h2 id="project-dialog-title">Create a project</h2></div>
           <button type="button" class="icon-button dialog-close" aria-label="Close">×</button>
         </div>
         <label>
@@ -71,11 +121,11 @@
         </label>
         <label>
           <span>Default agent command</span>
-          <input id="project-command" name="defaultCommand" value="codex" required spellcheck="false">
+          <input id="project-command" name="defaultCommand" value="omp" required spellcheck="false">
         </label>
         <div class="modal-actions">
           <button type="button" class="button ghost dialog-close">Cancel</button>
-          <button type="submit" id="create-project-button" class="button primary">Create project</button>
+          <button type="submit" id="save-project-button" class="button primary">Create project</button>
         </div>
       </form>
     </dialog>
@@ -88,7 +138,7 @@
         </div>
         <div class="kind-picker" role="radiogroup" aria-label="Window type">
           <button type="button" class="kind-option active" data-kind="agent">
-            <span class="kind-icon">◆</span><span><strong>Coding agent</strong><small>Start a command such as Codex</small></span>
+            <span class="kind-icon">◆</span><span><strong>Coding agent</strong><small>Start a command such as OMP</small></span>
           </button>
           <button type="button" class="kind-option" data-kind="terminal">
             <span class="kind-icon">›_</span><span><strong>Terminal</strong><small>Open a normal interactive shell</small></span>
@@ -107,8 +157,8 @@
         </label>
         <label id="command-field">
           <span>Command</span>
-          <input id="window-command" name="command" value="codex" spellcheck="false">
-          <small>Examples: codex, claude, opencode</small>
+          <input id="window-command" name="command" value="omp" spellcheck="false">
+          <small>Examples: omp, codex, claude, opencode</small>
         </label>
         <div class="modal-actions">
           <button type="button" class="button ghost dialog-close">Cancel</button>
@@ -117,9 +167,31 @@
       </form>
     </dialog>
 
+    <dialog id="settings-dialog" class="modal settings-modal">
+      <form method="dialog">
+        <div class="modal-header">
+          <div><p class="eyebrow">Application</p><h2>Settings</h2></div>
+          <button type="button" class="icon-button dialog-close" aria-label="Close">×</button>
+        </div>
+        <label class="setting-control">
+          <span><strong>Terminal font size</strong><output id="settings-font-size-output">11px</output></span>
+          <input id="terminal-font-size-range" type="range" min="8" max="24" step="1" value="11">
+          <small>Use Ctrl++ and Ctrl+- from a terminal at any time.</small>
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="button primary dialog-close">Done</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="project-context-menu" class="context-menu" role="menu" hidden>
+      <button type="button" role="menuitem" data-context-action="edit-project">Edit project settings</button>
+    </div>
+
     <div id="toast" class="toast" role="status"></div>
     <script src="./vendor/xterm.js"></script>
     <script src="./vendor/addon-fit.js"></script>
+    <script src="./ui-layout.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

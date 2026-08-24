@@ -8,8 +8,9 @@
     "vendor": "node scripts/copy-vendor.mjs",
     "dev": "npm run vendor && tauri dev",
     "build": "npm run vendor && tauri build",
-    "check": "node --check public/app.js && cargo check --manifest-path src-tauri/Cargo.toml",
-    "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "postbuild": "node scripts/install-local.mjs",
+    "check": "node --check public/ui-layout.js && node --check public/app.js && cargo check --manifest-path src-tauri/Cargo.toml",
+    "test": "node --test tests/ui-layout.test.js && cargo test --manifest-path src-tauri/Cargo.toml",
     "tauri": "tauri"
   },
   "engines": {

@@ -1,27 +1,45 @@
 # Tmux Agent Grid
 
-A lightweight Tauri desktop application for organizing persistent terminals and coding agents into draggable, tiled projects.
+A Linux Tauri desktop application for organizing persistent tmux terminals and coding agents into draggable, tiled projects.
 
 ## Features
 
-- Projects group related terminal windows under a default directory and agent command.
-- The project sidebar shows how many agents have recent terminal activity without opening the project.
-- Windows can run a coding agent or a normal interactive terminal.
-- Every window runs in a persistent tmux session, so it survives closing the app.
-- Live status distinguishes running, waiting, exited, ready-terminal, and stopped states.
-- Windows can be dragged, split, swapped, resized, maximized, or automatically tiled.
-- Layouts are saved separately for each project.
+- Projects group related agent and terminal windows under a default directory and command.
+- Right-click a project name to edit its settings; drag project rows to persist a custom order.
+- Project status squares show one color-coded state per open window: working, ready, needs input, attention, exited, or stopped.
+- OMP is the default coding-agent command. OMP status is read from its terminal breadcrumb and structured session log instead of inferred from terminal redraws.
+- Codex sessions retain explicit rollout-state detection and full-conversation handoff forks.
+- Every window runs in a persistent tmux session and survives closing the application.
+- Windows can be dragged, split, swapped, resized, maximized, automatically tiled, or popped into a separate native window.
+- Compact mode provides a pinned `390×780` portrait window with hamburger navigation between projects and chats.
+- Per-project layouts, sidebar width, and sidebar section proportions persist between launches.
+- Activity timelines retain prompts, process changes, ports, and handoffs for up to 30 days.
+- Listening TCP ports are attributed to their owning tmux pane and can be opened or copied from the UI.
+- Terminal font size is configured under Settings or with `Ctrl++`, `Ctrl+-`, `Ctrl+0`, and `Ctrl+mouse wheel`.
+- `Ctrl+Shift+C` copies terminal selections while `Ctrl+C` remains available for interrupts.
+- Shift+Tab is forwarded as back-tab, and Shift+Enter inserts a new line in agent chats.
+
+## Supported platform
+
+The application currently targets Linux desktops. Its persistence and process-status backend directly uses `tmux`, `/proc`, and Linux socket information.
+
+Windows is not a native target. The practical Windows option is Linux under WSL2 with WSLg; see [Windows support](#windows-support).
 
 ## Requirements
 
-The application currently targets Linux desktops. To build it you need:
+Required to build and run:
 
+- Linux desktop session with WebKitGTK 4.1 support
 - Node.js 20 or newer and npm
-- The stable Rust toolchain, including Cargo
-- tmux available on `PATH`
-- Tauri's Linux system libraries
+- Stable Rust toolchain, including Cargo
+- `tmux` available on `PATH`
+- Tauri v2 Linux system libraries
 
-On Debian or Ubuntu, install tmux and the current Tauri v2 prerequisites with:
+Runtime agent commands are configurable per project. `omp` must be on `PATH` to use the default OMP integration. Codex, Claude, OpenCode, and other interactive commands are optional alternatives. Git is optional but required for complete handoff repository snapshots.
+
+### Debian or Ubuntu dependencies
+
+These packages follow the official [Tauri v2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/) and add tmux:
 
 ```bash
 sudo apt update
@@ -29,84 +47,171 @@ sudo apt install tmux libwebkit2gtk-4.1-dev build-essential curl wget file \
   libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 ```
 
-Install Rust with [rustup](https://rustup.rs/) and install the Node.js LTS release if they are not already present. Tauri also lists packages for Arch, Fedora, openSUSE, Alpine, and other distributions in its [official prerequisites guide](https://v2.tauri.app/start/prerequisites/).
-
-## Development
-
-Clone the repository, then install the locked JavaScript dependencies:
+### Arch Linux dependencies
 
 ```bash
-git clone <repository-url>
+sudo pacman -Syu
+sudo pacman -S --needed tmux webkit2gtk-4.1 base-devel curl wget file \
+  openssl appmenu-gtk-module libappindicator-gtk3 librsvg xdotool
+```
+
+For other distributions, install the equivalent WebKitGTK 4.1 development package, compiler toolchain, OpenSSL development headers, app-indicator library, librsvg, and tmux. Consult the current [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) when package names differ.
+
+### Rust
+
+Install stable Rust with rustup:
+
+```bash
+curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf | sh
+```
+
+Restart the shell afterward, or load Cargo immediately:
+
+```bash
+source "$HOME/.cargo/env"
+```
+
+Confirm the toolchain:
+
+```bash
+rustc --version
+cargo --version
+```
+
+### Node.js
+
+Install Node.js 20 or newer using the Node.js LTS installer, your distribution, or a version manager. Confirm both executables:
+
+```bash
+node --version
+npm --version
+```
+
+## Installation from source
+
+Clone the repository and install the locked JavaScript dependencies:
+
+```bash
+git clone https://github.com/TauchmanD/viber.git tmux-agent-grid
 cd tmux-agent-grid
 npm ci
 ```
 
-If Cargo was just installed and is not yet available in the shell, reload the shell or run:
-
-```bash
-source ~/.cargo/env
-```
-
-Start the development application:
-
-```bash
-npm run dev
-```
-
-`npm run dev` copies xterm.js from `node_modules` into the generated `public/vendor` directory before starting Tauri.
-
-## Checks and tests
-
-Run the JavaScript syntax check and Rust compile check:
+Run the checks before building:
 
 ```bash
 npm run check
-```
-
-Run the Rust tests:
-
-```bash
 npm test
 ```
 
-The session lifecycle test starts short-lived tmux sessions, so tmux must be installed and usable by the current user.
-
-## Release build
-
-Build an optimized standalone executable:
+Build the optimized standalone application:
 
 ```bash
 npm run build -- --no-bundle
 ```
 
-The binary is written to:
+The build writes and installs the executable at:
 
 ```text
 src-tauri/target/release/tmux-agent-grid
+~/.local/bin/tmux-agent-grid
 ```
 
-To build the configured AppImage bundle instead, run:
+Ensure the local binary directory is on `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add that export to your shell profile if necessary, then launch:
+
+```bash
+tmux-agent-grid
+```
+
+### Optional desktop launcher
+
+After the release build, install the launcher and icon for the current user:
+
+```bash
+install -Dm644 tmux-agent-grid.desktop \
+  "$HOME/.local/share/applications/tmux-agent-grid.desktop"
+install -Dm644 public/icon.svg \
+  "$HOME/.local/share/icons/hicolor/scalable/apps/tmux-agent-grid.svg"
+```
+
+Log out and back in, or refresh the desktop application database if the launcher does not appear immediately.
+
+## Development
+
+Install dependencies once with `npm ci`, then start the Tauri development application:
+
+```bash
+npm run dev
+```
+
+The development command copies the locked xterm.js assets from `node_modules` into the ignored `public/vendor` directory before starting `tauri dev`.
+
+Application state is stored in Tauri's per-user application-data directory. Project pane layouts and UI preferences are stored in the webview's local storage. tmux sessions remain active after the webview or application closes.
+
+## Checks and tests
+
+Run JavaScript syntax checks and the Rust compile check:
+
+```bash
+npm run check
+```
+
+Run JavaScript unit tests and Rust tests:
+
+```bash
+npm test
+```
+
+The Rust suite includes short-lived tmux lifecycle tests, so tmux must be installed and usable by the current user.
+
+## Release builds
+
+### Standalone executable
+
+```bash
+npm run build -- --no-bundle
+```
+
+This performs the frontend vendor copy, optimized Tauri build, and post-build installation to `~/.local/bin/tmux-agent-grid`.
+
+### AppImage
 
 ```bash
 npm run build
 ```
 
-AppImages should be built on an older supported Linux distribution so they do not accidentally depend on system libraries newer than those on the target machines.
+The configured bundle target is AppImage. Bundle output is written below:
+
+```text
+src-tauri/target/release/bundle/appimage/
+```
+
+Build distributable AppImages on the oldest supported Linux distribution so the executable does not accidentally require newer glibc or system-library versions.
 
 ## Windows support
 
-Not as a native Windows application today. Tauri and the PTY library support Windows, but this application's persistence and process-status backend directly launches the `tmux` executable. The tmux project supports Unix-like platforms and does not provide a native Windows build.
+The current backend launches tmux directly and uses Linux-specific process and socket APIs, so merely cross-compiling does not create a functional native Windows build.
 
-The practical Windows option is to build and run the Linux application inside WSL2 with WSLg. Install the Linux requirements above inside the WSL distribution, keep the repository in the WSL filesystem, and run `npm run dev` there. A Windows-native release would require replacing the tmux backend with a Windows session host (for example, a ConPTY-based service); merely cross-compiling the current source is not enough.
+To run under Windows, install the Linux requirements inside WSL2, enable WSLg, keep the repository in the WSL filesystem, and run `npm run dev` or the Linux release build there. Native Windows support would require replacing tmux with a Windows session host such as a ConPTY-based service.
 
 ## Project structure
 
 ```text
-public/                 Plain HTML, CSS, and JavaScript frontend
-scripts/copy-vendor.mjs Frontend dependency copy step
-src-tauri/src/          Rust state, PTY, tmux, and Tauri commands
+public/                  Plain HTML, CSS, and JavaScript frontend
+public/ui-layout.js      Shared, testable UI sizing constraints
+scripts/copy-vendor.mjs  Frontend dependency copy step
+scripts/install-local.mjs
+                         Release installation into ~/.local/bin
+src-tauri/src/           Rust state, PTY, tmux, status, and Tauri commands
+tests/                   Node.js frontend unit tests
 src-tauri/tauri.conf.json
-                        Desktop window and bundle configuration
+                         Desktop window and bundle configuration
 ```
 
-Application state is stored in Tauri's per-user application data directory. Project layouts are stored in the webview's local storage. Local dependencies, build artifacts, copied vendor files, and legacy `.data` state are intentionally excluded from Git.
+Generated frontend vendor files, local dependencies, build artifacts, application state, and legacy `.data` state are intentionally excluded from Git.
