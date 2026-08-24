@@ -33,9 +33,10 @@ Required to build and run:
 - Node.js 20 or newer and npm
 - Stable Rust toolchain, including Cargo
 - `tmux` available on `PATH`
+- [OMP](https://github.com/can1357/oh-my-pi) available as `omp` on `PATH`
 - Tauri v2 Linux system libraries
 
-Runtime agent commands are configurable per project. `omp` must be on `PATH` to use the default OMP integration. Codex, Claude, OpenCode, and other interactive commands are optional alternatives. Git is optional but required for complete handoff repository snapshots.
+OMP is the default and supported agent harness for this application. Project commands remain configurable, but the documented setup assumes OMP. Codex, Claude, OpenCode, and other interactive commands are optional alternatives. Git is optional but required for complete handoff repository snapshots.
 
 ### Debian or Ubuntu dependencies
 
@@ -86,6 +87,66 @@ Install Node.js 20 or newer using the Node.js LTS installer, your distribution, 
 node --version
 npm --version
 ```
+
+### OMP agent harness
+
+Install the official OMP release on Linux:
+
+```bash
+curl -fsSL https://omp.sh/install | sh
+```
+
+Confirm that the installed binary is available to desktop applications and shells:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+command -v omp
+omp --version
+```
+
+Add the `PATH` export to your shell profile if `command -v omp` does not find the binary in a new terminal.
+
+The official alternative for users who already have Bun 1.3.14 or newer is:
+
+```bash
+bun install -g @oh-my-pi/pi-coding-agent
+```
+
+Configure at least one model provider. Start OMP and use its interactive login flow:
+
+```bash
+omp
+```
+
+Then run `/login` inside OMP and select a provider. `/login anthropic` and `/login openai-codex` jump directly to those providers. OMP stores successful login credentials in its local auth store.
+
+API keys can instead be supplied through the provider environment variables, for example:
+
+```bash
+export ANTHROPIC_API_KEY="..."
+export OPENAI_API_KEY="..."
+export GEMINI_API_KEY="..."
+```
+
+Do not commit provider keys. OMP also loads project-local and user-level `.env` files; see the official [provider and credential guide](https://github.com/can1357/oh-my-pi/blob/main/docs/providers.md) for precedence and additional providers.
+
+Verify the harness in a project directory:
+
+```bash
+cd /path/to/project
+omp
+```
+
+Keep OMP session persistence enabled. Tmux Agent Grid maps each OMP process to its terminal breadcrumb and reads the structured session JSONL to distinguish Working, Ready, Needs input, and Attention. Commands using `omp --no-session` cannot provide those structured status signals and fall back to generic terminal activity.
+
+Check for and install OMP updates with:
+
+```bash
+omp update --check
+omp update
+```
+
+The upstream installation and release documentation is maintained at [omp.sh](https://omp.sh) and [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi).
 
 ## Installation from source
 
