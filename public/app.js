@@ -1029,8 +1029,8 @@ async function refreshRepository() {
   repositoryFile = null;
   repositoryEntries = [];
   document.querySelector("#repository-project-name").textContent = project.name;
-  repositoryTree.innerHTML = `<div class="repository-tree-empty">Reading repository…</div>`;
   showRepositoryPreview("Choose a file", "Select source code or documentation from the repository.");
+  repositoryTree.innerHTML = `<div class="repository-tree-empty">Reading repository…</div>`;
   try {
     const repository = await call("get_repository", { projectId });
     if (activeProjectId !== projectId || repositoryBrowser.hidden) return;
@@ -1043,8 +1043,8 @@ async function refreshRepository() {
   } catch (error) {
     repositoryEntries = [];
     repositoryTruncated = false;
-    repositoryTree.innerHTML = `<div class="repository-tree-empty error">${escapeHtml(error.message)}</div>`;
     showRepositoryPreview("Repository unavailable", error.message, true);
+    repositoryTree.innerHTML = `<div class="repository-tree-empty error">${escapeHtml(error.message)}</div>`;
   }
 }
 
@@ -1062,7 +1062,7 @@ async function openRepository(projectId = activeProjectId) {
   document.querySelector("#repository-button").classList.add("active");
   document.querySelector("#repository-button").setAttribute("aria-pressed", "true");
   updateEditorControls();
-  await refreshRepository();
+  if (repositoryProjectId !== projectId) await refreshRepository();
 }
 
 function closeRepository() {
@@ -1211,6 +1211,7 @@ async function render() {
   document.querySelector("#repository-button").disabled = !project || Boolean(popoutWindowId);
   updateEditorControls();
   if (!project && !repositoryBrowser.hidden) closeRepository();
+  const repositoryNeedsRefresh = !repositoryBrowser.hidden && repositoryProjectId !== project?.id;
   grid.classList.remove("has-maximized", "drag-active");
 
   const windows = activeWindows();
@@ -1220,6 +1221,7 @@ async function render() {
     maximizedWindowId = null;
     renderEmptyState();
     if (workspace.classList.contains("activity-open")) await refreshTimeline();
+    if (repositoryNeedsRefresh) await refreshRepository();
     return;
   }
   if (!windows.some((window) => window.id === selectedWindowId)) selectedWindowId = windows[0].id;
@@ -1229,6 +1231,7 @@ async function render() {
   grid.classList.toggle("has-maximized", Boolean(maximizedWindowId));
   await Promise.all(windows.map(connectTerminal));
   if (workspace.classList.contains("activity-open")) await refreshTimeline();
+  if (repositoryNeedsRefresh) await refreshRepository();
 }
 
 async function refreshProjects({ quiet = false } = {}) {
@@ -1516,6 +1519,7 @@ async function setCompactMode(enabled) {
     button.title = enabled ? "Exit compact view" : "Compact view";
     if (enabled) {
       if (workspace.classList.contains("activity-open")) closeActivityPanel();
+      if (!repositoryBrowser.hidden) closeRepository();
       compactPreviousMaximizedId = maximizedWindowId;
       selectedWindowId ||= activeWindows()[0]?.id || null;
       applyMaximizedWindow(selectedWindowId);
@@ -1587,7 +1591,10 @@ document.querySelector("#new-project-button").addEventListener("click", openProj
 newWindowButton.addEventListener("click", openWindowModal);
 document.querySelector("#activity-button").addEventListener("click", () => {
   if (workspace.classList.contains("activity-open")) closeActivityPanel();
-  else openActivityPanel();
+  else {
+    closeRepository();
+    openActivityPanel();
+  }
 });
 document.querySelector("#close-activity-button").addEventListener("click", closeActivityPanel);
 document.querySelector("#refresh-button").addEventListener("click", () => refreshProjects());
