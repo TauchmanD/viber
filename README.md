@@ -8,6 +8,7 @@ A Linux Tauri desktop application for organizing persistent tmux terminals and c
 - Right-click a project name to edit its settings; drag project rows to persist a custom order.
 - Project status squares show one color-coded state per open window: working, ready, needs input, attention, exited, or stopped.
 - OMP is the default coding-agent command. OMP status is read from its terminal breadcrumb and structured session log instead of inferred from terminal redraws.
+- The Git sidebar shows the current branch, local branches, working-tree changes, ahead/behind counts, branch switching, fast-forward pulls, and push/publish actions.
 - Codex sessions retain explicit rollout-state detection and full-conversation handoff forks.
 - Every window runs in a persistent tmux session and survives closing the application.
 - Windows can be dragged, split, swapped, resized, maximized, automatically tiled, or popped into a separate native window.
@@ -33,18 +34,19 @@ Required to build and run:
 - Node.js 20 or newer and npm
 - Stable Rust toolchain, including Cargo
 - `tmux` available on `PATH`
+- `git` available on `PATH`
 - [OMP](https://github.com/can1357/oh-my-pi) available as `omp` on `PATH`
 - Tauri v2 Linux system libraries
 
-OMP is the default and supported agent harness for this application. Project commands remain configurable, but the documented setup assumes OMP. Codex, Claude, OpenCode, and other interactive commands are optional alternatives. Git is optional but required for complete handoff repository snapshots.
+OMP is the default and supported agent harness for this application. Project commands remain configurable, but the documented setup assumes OMP. Codex, Claude, OpenCode, and other interactive commands are optional alternatives. Git powers the sidebar branch controls and complete handoff repository snapshots.
 
 ### Debian or Ubuntu dependencies
 
-These packages follow the official [Tauri v2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/) and add tmux:
+These packages follow the official [Tauri v2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/) and add Git and tmux:
 
 ```bash
 sudo apt update
-sudo apt install tmux libwebkit2gtk-4.1-dev build-essential curl wget file \
+sudo apt install git tmux libwebkit2gtk-4.1-dev build-essential curl wget file \
   libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 ```
 
@@ -52,11 +54,11 @@ sudo apt install tmux libwebkit2gtk-4.1-dev build-essential curl wget file \
 
 ```bash
 sudo pacman -Syu
-sudo pacman -S --needed tmux webkit2gtk-4.1 base-devel curl wget file \
+sudo pacman -S --needed git tmux webkit2gtk-4.1 base-devel curl wget file \
   openssl appmenu-gtk-module libappindicator-gtk3 librsvg xdotool
 ```
 
-For other distributions, install the equivalent WebKitGTK 4.1 development package, compiler toolchain, OpenSSL development headers, app-indicator library, librsvg, and tmux. Consult the current [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) when package names differ.
+For other distributions, install the equivalent WebKitGTK 4.1 development package, compiler toolchain, OpenSSL development headers, app-indicator library, librsvg, Git, and tmux. Consult the current [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) when package names differ.
 
 ### Rust
 

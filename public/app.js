@@ -15,6 +15,12 @@ const grid = document.querySelector("#terminal-grid");
 const projectList = document.querySelector("#project-list");
 const windowList = document.querySelector("#window-list");
 const windowCount = document.querySelector("#window-count");
+const gitSection = document.querySelector("#git-section");
+const gitBranchSelect = document.querySelector("#git-branch-select");
+const gitSummary = document.querySelector("#git-summary");
+const gitRefreshButton = document.querySelector("#git-refresh-button");
+const gitPullButton = document.querySelector("#git-pull-button");
+const gitPushButton = document.querySelector("#git-push-button");
 const projectDialog = document.querySelector("#project-dialog");
 const windowDialog = document.querySelector("#window-dialog");
 const settingsDialog = document.querySelector("#settings-dialog");
@@ -30,10 +36,19 @@ const toast = document.querySelector("#toast");
 const activityPanel = document.querySelector("#activity-panel");
 const activityTimeline = document.querySelector("#activity-timeline");
 const activityPanelPorts = document.querySelector("#activity-panel-ports");
+const repositoryBrowser = document.querySelector("#repository-browser");
+const repositoryTree = document.querySelector("#repository-tree");
+const repositoryFileContent = document.querySelector("#repository-file-content");
+const repositoryPreviewEmpty = document.querySelector("#repository-preview-empty");
+const repositoryCopyButton = document.querySelector("#repository-copy-button");
+const preferredEditorSelect = document.querySelector("#preferred-editor-select");
+const preferredEditorCustom = document.querySelector("#preferred-editor-custom");
 const terminals = new Map();
 const sidebarWidthKey = "agent-grid-sidebar-width";
 const projectSectionShareKey = "agent-grid-projects-share";
 const legacyProjectSectionHeightKey = "agent-grid-projects-height";
+const preferredEditorKey = "agent-grid-preferred-editor";
+const preferredEditorCustomKey = "agent-grid-preferred-editor-custom";
 
 let projects = [];
 let activeProjectId = localStorage.getItem("agent-grid-project");
@@ -42,6 +57,8 @@ let windowKind = "agent";
 let layoutMode = localStorage.getItem("agent-grid-mode") || "auto";
 let layoutColumns = Math.min(8, Math.max(1, Number(localStorage.getItem("agent-grid-columns")) || 2));
 let terminalFontSize = Math.min(24, Math.max(8, Number(localStorage.getItem("agent-grid-font-size")) || 11));
+let preferredEditor = localStorage.getItem(preferredEditorKey) || "code";
+let preferredEditorCommand = localStorage.getItem(preferredEditorCustomKey) || "";
 let sidebarWidth = UiLayout.clampSidebarWidth(localStorage.getItem(sidebarWidthKey));
 let projectSectionShare = localStorage.getItem(projectSectionShareKey);
 let projectSectionHeight = 0;
@@ -60,10 +77,21 @@ const popoutChannel = typeof BroadcastChannel === "function"
 let toastTimer;
 let statusTimer;
 let statusRequestInFlight = false;
+let gitStatus = null;
+let gitStatusProjectId = null;
+let gitStatusError = null;
+let gitStatusTimer;
+let gitOperationInFlight = false;
 let selectedWindowId = null;
 let timelineFilter = "all";
 let timelineEvents = [];
 let handoffInFlight = false;
+let repositoryEntries = [];
+let repositoryFile = null;
+let repositoryProjectId = null;
+let repositoryFilter = "all";
+let repositoryTruncated = false;
+let collapsedRepositoryPaths = new Set();
 
 const activityQuietMs = 5000;
 
@@ -495,6 +523,7 @@ function renderProjects() {
           <span class="project-count">${project.windows.length} window${project.windows.length === 1 ? "" : "s"}</span>
         </span>
       </button>
+      <button class="project-editor icon-button" data-open-project-editor="${project.id}" aria-label="Open ${escapeHtml(project.name)} in preferred editor" title="Open in preferred editor">&lt;/&gt;</button>
       <button class="project-delete icon-button" data-delete-project="${project.id}" title="Delete project">×</button>
     </div>`;
   }).join("");
@@ -878,6 +907,174 @@ function setTerminalFontSize(size) {
   }
 }
 
+const editorLabels = {
+  code: "VS Code",
+  cursor: "Cursor",
+  zed: "Zed",
+  subl: "Sublime Text",
+  idea: "IntelliJ IDEA",
+  custom: "custom editor",
+};
+
+function selectedEditor() {
+  const command = preferredEditor === "custom" ? preferredEditorCommand.trim() : preferredEditor;
+  return { command, label: editorLabels[preferredEditor] || preferredEditor };
+}
+
+function updateEditorControls() {
+  if (!editorLabels[preferredEditor]) preferredEditor = "code";
+  preferredEditorSelect.value = preferredEditor;
+  preferredEditorCustom.value = preferredEditorCommand;
+  preferredEditorCustom.hidden = preferredEditor !== "custom";
+  const editor = selectedEditor();
+  document.querySelector("#repository-editor-label").textContent = editor.label;
+  document.querySelector("#repository-open-editor-button").disabled = !activeProject() || !editor.command;
+}
+
+async function openProjectInEditor(projectId = activeProjectId) {
+  const project = projects.find((item) => item.id === projectId);
+  if (!project) return;
+  const editor = selectedEditor();
+  if (!editor.command) {
+    openSettings();
+    showToast("Enter a custom editor executable.", true);
+    return;
+  }
+  try {
+    await call("open_project_in_editor", { projectId, editorCommand: editor.command });
+    showToast(`${project.name} opened in ${editor.label}.`);
+  } catch (error) {
+    showToast(`Could not open ${editor.label}: ${error.message}`, true);
+  }
+}
+
+function formatFileSize(size) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KiB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function repositoryAncestors(path) {
+  const parts = path.split("/");
+  return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
+}
+
+function renderRepositoryTree() {
+  let entries;
+  if (repositoryFilter === "documentation") {
+    entries = repositoryEntries.filter((entry) => entry.documentation);
+  } else {
+    entries = repositoryEntries.filter((entry) =>
+      !repositoryAncestors(entry.path).some((ancestor) => collapsedRepositoryPaths.has(ancestor)));
+  }
+  repositoryTree.innerHTML = entries.length ? entries.map((entry) => {
+    const selected = repositoryFile?.path === entry.path;
+    if (repositoryFilter === "documentation") {
+      return `<button class="repository-tree-item documentation ${selected ? "selected" : ""}" type="button" role="treeitem" data-repository-path="${escapeHtml(entry.path)}">
+        <span class="repository-entry-icon">¶</span>
+        <span class="repository-entry-copy"><strong>${escapeHtml(entry.name)}</strong><small>${escapeHtml(entry.path)}</small></span>
+      </button>`;
+    }
+    const collapsed = entry.isDirectory && collapsedRepositoryPaths.has(entry.path);
+    return `<button class="repository-tree-item ${entry.isDirectory ? "directory" : ""} ${selected ? "selected" : ""}" type="button" role="treeitem" aria-expanded="${entry.isDirectory ? String(!collapsed) : "false"}" data-repository-path="${escapeHtml(entry.path)}" style="--repository-depth:${entry.depth}">
+      <span class="repository-entry-icon">${entry.isDirectory ? (collapsed ? "›" : "⌄") : (entry.documentation ? "¶" : "·")}</span>
+      <span class="repository-entry-copy"><strong>${escapeHtml(entry.name)}</strong></span>
+    </button>`;
+  }).join("") : `<div class="repository-tree-empty">${repositoryFilter === "documentation" ? "No documentation files found." : "This repository is empty."}</div>`;
+  document.querySelector("#repository-limit-note").hidden = !repositoryTruncated;
+}
+
+function showRepositoryPreview(title, message, isError = false) {
+  repositoryFile = null;
+  repositoryFileContent.hidden = true;
+  repositoryCopyButton.hidden = true;
+  repositoryPreviewEmpty.hidden = false;
+  repositoryPreviewEmpty.classList.toggle("error", isError);
+  repositoryPreviewEmpty.innerHTML = `<span aria-hidden="true">${isError ? "!" : "⌁"}</span><strong>${escapeHtml(title)}</strong><p>${escapeHtml(message)}</p>`;
+  document.querySelector("#repository-file-path").textContent = title;
+  document.querySelector("#repository-file-meta").textContent = message;
+  renderRepositoryTree();
+}
+
+async function readRepositoryFile(path) {
+  const project = activeProject();
+  if (!project) return;
+  const projectId = project.id;
+  document.querySelector("#repository-file-path").textContent = path;
+  document.querySelector("#repository-file-meta").textContent = "Loading preview…";
+  try {
+    const file = await call("read_repository_file", { projectId, path });
+    if (activeProjectId !== projectId || repositoryBrowser.hidden) return;
+    repositoryFile = file;
+    repositoryFileContent.querySelector("code").textContent = file.content;
+    repositoryFileContent.classList.toggle("documentation", file.documentation);
+    repositoryFileContent.hidden = false;
+    repositoryPreviewEmpty.hidden = true;
+    repositoryCopyButton.hidden = false;
+    document.querySelector("#repository-file-path").textContent = file.path;
+    const lines = file.content ? file.content.split("\n").length : 0;
+    document.querySelector("#repository-file-meta").textContent =
+      `${file.documentation ? "Documentation" : "Source"} · ${formatFileSize(file.size)} · ${lines} line${lines === 1 ? "" : "s"}`;
+    renderRepositoryTree();
+  } catch (error) {
+    showRepositoryPreview(path, error.message, true);
+  }
+}
+
+async function refreshRepository() {
+  const project = activeProject();
+  if (!project) return;
+  const projectId = project.id;
+  repositoryProjectId = projectId;
+  repositoryFile = null;
+  repositoryEntries = [];
+  document.querySelector("#repository-project-name").textContent = project.name;
+  repositoryTree.innerHTML = `<div class="repository-tree-empty">Reading repository…</div>`;
+  showRepositoryPreview("Choose a file", "Select source code or documentation from the repository.");
+  try {
+    const repository = await call("get_repository", { projectId });
+    if (activeProjectId !== projectId || repositoryBrowser.hidden) return;
+    repositoryEntries = repository.entries;
+    repositoryTruncated = repository.truncated;
+    collapsedRepositoryPaths = new Set(repository.entries
+      .filter((entry) => entry.isDirectory)
+      .map((entry) => entry.path));
+    renderRepositoryTree();
+  } catch (error) {
+    repositoryEntries = [];
+    repositoryTruncated = false;
+    repositoryTree.innerHTML = `<div class="repository-tree-empty error">${escapeHtml(error.message)}</div>`;
+    showRepositoryPreview("Repository unavailable", error.message, true);
+  }
+}
+
+async function openRepository(projectId = activeProjectId) {
+  if (!projectId || popoutWindowId) return;
+  if (projectId !== activeProjectId) {
+    activeProjectId = projectId;
+    localStorage.setItem("agent-grid-project", projectId);
+    await render();
+    await refreshGitStatus({ quiet: true });
+  }
+  closeActivityPanel();
+  grid.hidden = true;
+  repositoryBrowser.hidden = false;
+  document.querySelector("#repository-button").classList.add("active");
+  document.querySelector("#repository-button").setAttribute("aria-pressed", "true");
+  updateEditorControls();
+  await refreshRepository();
+}
+
+function closeRepository() {
+  if (repositoryBrowser.hidden) return;
+  repositoryBrowser.hidden = true;
+  grid.hidden = false;
+  repositoryProjectId = null;
+  document.querySelector("#repository-button").classList.remove("active");
+  document.querySelector("#repository-button").setAttribute("aria-pressed", "false");
+  requestAnimationFrame(() => terminals.forEach((entry) => entry.fitAddon.fit()));
+}
+
 function matchesTimelineFilter(event) {
   if (timelineFilter === "all") return true;
   if (timelineFilter === "port") return event.kind.startsWith("port");
@@ -1007,9 +1204,13 @@ async function render() {
   renderCompactNavigation();
   updateLayoutControls();
   updateFontControls();
+  renderGitStatus();
   const project = activeProject();
   document.querySelector("#workspace-title").textContent = project ? project.name : "Agent Grid";
   newWindowButton.disabled = !project;
+  document.querySelector("#repository-button").disabled = !project || Boolean(popoutWindowId);
+  updateEditorControls();
+  if (!project && !repositoryBrowser.hidden) closeRepository();
   grid.classList.remove("has-maximized", "drag-active");
 
   const windows = activeWindows();
@@ -1042,6 +1243,7 @@ async function refreshProjects({ quiet = false } = {}) {
       else localStorage.removeItem("agent-grid-project");
     }
     await render();
+    if (!popoutWindowId) await refreshGitStatus({ quiet: true });
     if (!quiet) showToast("Projects refreshed.");
   } catch (error) { showToast(error.message, true); }
 }
@@ -1061,6 +1263,114 @@ function updateProjectStatusSquares() {
       element.outerHTML = projectStatusSquares(project);
     });
   }
+}
+
+function renderGitStatus() {
+  const project = activeProject();
+  const status = gitStatusProjectId === project?.id ? gitStatus : null;
+  const loading = Boolean(project) && !status && !gitStatusError;
+  gitSection.classList.toggle("unavailable", !status?.available);
+  gitRefreshButton.disabled = !project || gitOperationInFlight;
+
+  if (!project) {
+    gitBranchSelect.innerHTML = "<option>No project</option>";
+    gitBranchSelect.disabled = true;
+    gitPullButton.disabled = true;
+    gitPushButton.disabled = true;
+    gitSummary.textContent = "No project selected";
+    return;
+  }
+  if (loading) {
+    gitBranchSelect.innerHTML = "<option>Loading…</option>";
+    gitBranchSelect.disabled = true;
+    gitPullButton.disabled = true;
+    gitPushButton.disabled = true;
+    gitSummary.textContent = "Reading Git status…";
+    return;
+  }
+  if (!status?.available) {
+    gitBranchSelect.innerHTML = `<option>${escapeHtml(status?.head || "Git unavailable")}</option>`;
+    gitBranchSelect.disabled = true;
+    gitPullButton.disabled = true;
+    gitPushButton.disabled = true;
+    gitSummary.textContent = gitStatusError || "Not a Git repository";
+    return;
+  }
+
+  const detached = status.branch ? "" : `<option value="" selected disabled>${escapeHtml(status.head)}</option>`;
+  gitBranchSelect.innerHTML = detached + status.branches.map((branch) =>
+    `<option value="${escapeHtml(branch)}" ${branch === status.branch ? "selected" : ""}>${escapeHtml(branch)}</option>`
+  ).join("");
+  gitBranchSelect.disabled = gitOperationInFlight || !status.branches.length;
+  gitPullButton.disabled = gitOperationInFlight || !status.hasUpstream;
+  gitPushButton.disabled = gitOperationInFlight || !status.branch;
+  gitPullButton.title = status.hasUpstream ? `Pull ${status.upstream}` : "Current branch has no upstream";
+  gitPushButton.title = status.hasUpstream ? `Push ${status.upstream}` : "Publish current branch to origin";
+
+  const summary = [
+    status.dirty ? `<span class="dirty">● changes</span>` : "Clean",
+    status.ahead ? `<span class="ahead">↑${status.ahead}</span>` : "",
+    status.behind ? `<span class="behind">↓${status.behind}</span>` : "",
+    status.upstream ? escapeHtml(status.upstream) : "No upstream",
+  ].filter(Boolean);
+  gitSummary.innerHTML = summary.join(" · ");
+}
+
+async function refreshGitStatus({ quiet = true } = {}) {
+  const project = activeProject();
+  if (!project || popoutWindowId) {
+    gitStatus = null;
+    gitStatusProjectId = null;
+    gitStatusError = null;
+    renderGitStatus();
+    return;
+  }
+  const projectId = project.id;
+  try {
+    const status = await call("get_git_status", { projectId });
+    if (activeProjectId !== projectId) return;
+    gitStatus = status;
+    gitStatusProjectId = projectId;
+    gitStatusError = null;
+  } catch (error) {
+    if (activeProjectId !== projectId) return;
+    gitStatus = null;
+    gitStatusProjectId = projectId;
+    gitStatusError = error.message;
+    if (!quiet) showToast(`Git status failed: ${error.message}`, true);
+  }
+  renderGitStatus();
+}
+
+async function runGitOperation(command, args, successMessage) {
+  const project = activeProject();
+  if (!project || gitOperationInFlight) return;
+  const projectId = project.id;
+  gitOperationInFlight = true;
+  renderGitStatus();
+  try {
+    const status = await call(command, { projectId, ...args });
+    if (activeProjectId === projectId) {
+      gitStatus = status;
+      gitStatusProjectId = projectId;
+      gitStatusError = null;
+      showToast(successMessage);
+    }
+  } catch (error) {
+    showToast(`Git operation failed: ${error.message}`, true);
+    await refreshGitStatus({ quiet: true });
+  } finally {
+    gitOperationInFlight = false;
+    renderGitStatus();
+  }
+}
+
+function scheduleGitStatusPoll() {
+  clearTimeout(gitStatusTimer);
+  gitStatusTimer = setTimeout(async () => {
+    if (!document.hidden) await refreshGitStatus({ quiet: true });
+    scheduleGitStatusPoll();
+  }, 5000);
 }
 
 async function pollStatuses() {
@@ -1269,6 +1579,7 @@ async function returnPoppedOutChat(id) {
 
 function openSettings() {
   updateFontControls();
+  updateEditorControls();
   settingsDialog.showModal();
 }
 
@@ -1286,6 +1597,58 @@ document.querySelector("#more-columns-button").addEventListener("click", () => r
 document.querySelector("#compact-mode-button").addEventListener("click", () => setCompactMode(!compactMode));
 document.querySelector("#settings-button").addEventListener("click", openSettings);
 document.querySelector("#terminal-font-size-range").addEventListener("input", (event) => setTerminalFontSize(event.target.value));
+document.querySelector("#repository-button").addEventListener("click", () => {
+  if (repositoryBrowser.hidden) openRepository();
+  else closeRepository();
+});
+document.querySelector("#repository-close-button").addEventListener("click", closeRepository);
+document.querySelector("#repository-refresh-button").addEventListener("click", refreshRepository);
+document.querySelector("#repository-open-editor-button").addEventListener("click", () => openProjectInEditor());
+repositoryCopyButton.addEventListener("click", () => {
+  if (repositoryFile) copyText(repositoryFile.content, `${repositoryFile.path} copied.`);
+});
+document.querySelector(".repository-tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-repository-filter]");
+  if (!button) return;
+  repositoryFilter = button.dataset.repositoryFilter;
+  document.querySelectorAll("[data-repository-filter]").forEach((item) => item.classList.toggle("active", item === button));
+  renderRepositoryTree();
+});
+repositoryTree.addEventListener("click", (event) => {
+  const path = event.target.closest("[data-repository-path]")?.dataset.repositoryPath;
+  if (!path) return;
+  const entry = repositoryEntries.find((item) => item.path === path);
+  if (!entry) return;
+  if (entry.isDirectory) {
+    if (collapsedRepositoryPaths.has(path)) collapsedRepositoryPaths.delete(path);
+    else collapsedRepositoryPaths.add(path);
+    renderRepositoryTree();
+  } else {
+    readRepositoryFile(path);
+  }
+});
+preferredEditorSelect.addEventListener("change", () => {
+  preferredEditor = preferredEditorSelect.value;
+  localStorage.setItem(preferredEditorKey, preferredEditor);
+  updateEditorControls();
+});
+preferredEditorCustom.addEventListener("input", () => {
+  preferredEditorCommand = preferredEditorCustom.value;
+  localStorage.setItem(preferredEditorCustomKey, preferredEditorCommand);
+  updateEditorControls();
+});
+gitRefreshButton.addEventListener("click", () => refreshGitStatus({ quiet: false }));
+gitBranchSelect.addEventListener("change", () => {
+  if (gitBranchSelect.value && gitBranchSelect.value !== gitStatus?.branch) {
+    runGitOperation(
+      "switch_git_branch",
+      { branch: gitBranchSelect.value },
+      `Switched to ${gitBranchSelect.value}.`,
+    );
+  }
+});
+gitPullButton.addEventListener("click", () => runGitOperation("pull_git", {}, "Pull completed."));
+gitPushButton.addEventListener("click", () => runGitOperation("push_git", {}, "Push completed."));
 document.querySelector("#compact-menu-button").addEventListener("click", openCompactMenu);
 document.querySelector("#close-compact-menu-button").addEventListener("click", closeCompactMenu);
 compactDrawerBackdrop.addEventListener("click", closeCompactMenu);
@@ -1297,6 +1660,7 @@ compactProjectList.addEventListener("click", async (event) => {
   selectedWindowId = projects.find((project) => project.id === id)?.windows[0]?.id || null;
   closeCompactMenu();
   await render();
+  await refreshGitStatus({ quiet: true });
 });
 compactWindowList.addEventListener("click", (event) => {
   const id = event.target.closest("[data-compact-window]")?.dataset.compactWindow;
@@ -1373,12 +1737,15 @@ windowForm.addEventListener("submit", async (event) => {
 
 projectList.addEventListener("click", async (event) => {
   const deleteId = event.target.closest("[data-delete-project]")?.dataset.deleteProject;
+  const editorId = event.target.closest("[data-open-project-editor]")?.dataset.openProjectEditor;
+  if (editorId) return openProjectInEditor(editorId);
   if (deleteId) return deleteProject(deleteId);
   const id = event.target.closest("[data-project-id]")?.dataset.projectId;
   if (!id || id === activeProjectId) return;
   activeProjectId = id;
   localStorage.setItem("agent-grid-project", id);
   await render();
+  await refreshGitStatus({ quiet: true });
 });
 
 projectList.addEventListener("contextmenu", (event) => {
@@ -1395,11 +1762,13 @@ projectList.addEventListener("contextmenu", (event) => {
 });
 
 projectContextMenu.addEventListener("click", (event) => {
-  if (event.target.closest("[data-context-action='edit-project']") && contextProjectId) {
-    const id = contextProjectId;
-    closeProjectContextMenu();
-    openProjectSettings(id);
-  }
+  const action = event.target.closest("[data-context-action]")?.dataset.contextAction;
+  if (!action || !contextProjectId) return;
+  const id = contextProjectId;
+  closeProjectContextMenu();
+  if (action === "edit-project") openProjectSettings(id);
+  if (action === "browse-repository") openRepository(id);
+  if (action === "open-editor") openProjectInEditor(id);
 });
 
 document.addEventListener("pointerdown", (event) => {
@@ -1572,10 +1941,14 @@ async function init() {
   catch (error) { showToast(error.message, true); }
   await refreshProjects({ quiet: true });
   pollStatuses();
+  scheduleGitStatusPoll();
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) pollStatuses();
+  if (!document.hidden) {
+    pollStatuses();
+    refreshGitStatus({ quiet: true });
+  }
 });
 document.addEventListener("keydown", (event) => {
   if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
@@ -1595,6 +1968,7 @@ window.addEventListener("resize", () => {
 });
 window.addEventListener("beforeunload", () => {
   clearTimeout(statusTimer);
+  clearTimeout(gitStatusTimer);
   if (popoutWindowId && typeof tauriListen !== "function") {
     popoutChannel?.postMessage({ type: "closed", id: popoutWindowId });
   }

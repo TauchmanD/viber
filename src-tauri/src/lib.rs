@@ -17,6 +17,8 @@ use uuid::Uuid;
 const TIMELINE_MAX_EVENTS: usize = 500;
 const TIMELINE_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const INTERACTION_RUNNING_TTL_MS: u64 = 10_000;
+const REPOSITORY_ENTRY_LIMIT: usize = 5_000;
+const REPOSITORY_FILE_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -244,6 +246,46 @@ struct ProjectView {
     windows: Vec<WindowView>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitStatusView {
+    available: bool,
+    branch: Option<String>,
+    head: String,
+    branches: Vec<String>,
+    dirty: bool,
+    ahead: u32,
+    behind: u32,
+    has_upstream: bool,
+    upstream: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryEntry {
+    path: String,
+    name: String,
+    is_directory: bool,
+    depth: u16,
+    documentation: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryView {
+    entries: Vec<RepositoryEntry>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryFileView {
+    path: String,
+    content: String,
+    size: u64,
+    documentation: bool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "camelCase")]
 enum TerminalEvent {
@@ -342,6 +384,165 @@ fn validate_directory(value: &str) -> Result<String, String> {
         .unwrap_or(expanded)
         .to_string_lossy()
         .into_owned())
+}
+
+fn ignored_repository_directory(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".cache"
+            | ".next"
+            | ".nuxt"
+            | "build"
+            | "coverage"
+            | "dist"
+            | "node_modules"
+            | "target"
+    )
+}
+
+fn documentation_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "md" | "mdx" | "rst" | "adoc")
+        || name.starts_with("readme")
+        || name.starts_with("changelog")
+        || name.starts_with("contributing")
+        || matches!(name.as_str(), "license" | "authors" | "agents" | "claude")
+}
+
+fn collect_repository_entries(
+    directory: &Path,
+    relative_directory: &Path,
+    depth: u16,
+    entries: &mut Vec<RepositoryEntry>,
+    truncated: &mut bool,
+) -> Result<(), String> {
+    let mut children = fs::read_dir(directory)
+        .map_err(|error| format!("Could not read {}: {error}", directory.display()))?
+        .map(|entry| {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let file_type = entry.file_type().map_err(|error| error.to_string())?;
+            Ok((entry, file_type))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    children.sort_by(|(left, left_type), (right, right_type)| {
+        (
+            !left_type.is_dir(),
+            left.file_name().to_string_lossy().to_ascii_lowercase(),
+        )
+            .cmp(&(
+                !right_type.is_dir(),
+                right.file_name().to_string_lossy().to_ascii_lowercase(),
+            ))
+    });
+
+    for (entry, file_type) in children {
+        if entries.len() >= REPOSITORY_ENTRY_LIMIT {
+            *truncated = true;
+            return Ok(());
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if file_type.is_dir() && ignored_repository_directory(&name) {
+            continue;
+        }
+        let relative = relative_directory.join(&name);
+        let path = relative.to_string_lossy().replace('\\', "/");
+        let is_directory = file_type.is_dir();
+        entries.push(RepositoryEntry {
+            path,
+            name,
+            is_directory,
+            depth,
+            documentation: !is_directory && documentation_path(&relative),
+        });
+        if is_directory {
+            collect_repository_entries(
+                &entry.path(),
+                &relative,
+                depth.saturating_add(1),
+                entries,
+                truncated,
+            )?;
+            if *truncated {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_repository_root(root: &Path) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Could not open repository: {error}"))?;
+    if !root.is_dir() {
+        return Err("Project directory is not available.".into());
+    }
+    Ok(root)
+}
+
+fn list_repository_path(root: &Path) -> Result<RepositoryView, String> {
+    let root = canonical_repository_root(root)?;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    collect_repository_entries(&root, Path::new(""), 0, &mut entries, &mut truncated)?;
+    Ok(RepositoryView { entries, truncated })
+}
+
+fn resolve_repository_file(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let relative_path = Path::new(relative);
+    if relative_path.as_os_str().is_empty()
+        || relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("Invalid repository path.".into());
+    }
+    let root = canonical_repository_root(root)?;
+    let target = root
+        .join(relative_path)
+        .canonicalize()
+        .map_err(|error| format!("Could not open file: {error}"))?;
+    if !target.starts_with(&root) || !target.is_file() {
+        return Err("File is outside the project or is not available.".into());
+    }
+    Ok(target)
+}
+
+fn read_repository_path(root: &Path, relative: &str) -> Result<RepositoryFileView, String> {
+    let target = resolve_repository_file(root, relative)?;
+    let size = target
+        .metadata()
+        .map_err(|error| format!("Could not inspect file: {error}"))?
+        .len();
+    if size > REPOSITORY_FILE_LIMIT {
+        return Err(format!(
+            "File is larger than the {} MiB preview limit.",
+            REPOSITORY_FILE_LIMIT / (1024 * 1024)
+        ));
+    }
+    let bytes = fs::read(&target).map_err(|error| format!("Could not read file: {error}"))?;
+    if bytes.contains(&0) {
+        return Err("Binary files cannot be previewed.".into());
+    }
+    let content =
+        String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8 and cannot be previewed.")?;
+    Ok(RepositoryFileView {
+        path: relative.replace('\\', "/"),
+        content,
+        size,
+        documentation: documentation_path(Path::new(relative)),
+    })
 }
 
 fn session_exists(session_name: &str) -> bool {
@@ -1103,17 +1304,144 @@ fn capture_pane(window: &StoredWindow) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn git_output(cwd: &str, args: &[&str]) -> String {
-    let output = Command::new("git").arg("-C").arg(cwd).args(args).output();
-    let Ok(output) = output else {
-        return String::new();
-    };
+fn git_checked(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .map_err(|error| format!("Could not run git: {error}"))?;
     if !output.status.success() {
-        return String::new();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("git {} failed.", args.join(" "))
+        });
     }
-    strip_control_sequences(&String::from_utf8_lossy(&output.stdout))
+    Ok(strip_control_sequences(&String::from_utf8_lossy(&output.stdout))
         .trim()
-        .to_owned()
+        .to_owned())
+}
+
+fn git_output(cwd: &str, args: &[&str]) -> String {
+    git_checked(Path::new(cwd), args).unwrap_or_default()
+}
+
+fn git_status_for_path(cwd: &Path) -> Result<GitStatusView, String> {
+    let probe = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map_err(|error| format!("Could not run git: {error}"))?;
+    if !probe.status.success() {
+        return Ok(GitStatusView {
+            available: false,
+            branch: None,
+            head: "Not a Git repository".into(),
+            branches: Vec::new(),
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+            has_upstream: false,
+            upstream: None,
+        });
+    }
+
+    let branch = git_checked(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .filter(|value| !value.is_empty());
+    let head = branch.clone().unwrap_or_else(|| {
+        git_checked(cwd, &["rev-parse", "--short", "HEAD"])
+            .map(|value| format!("detached@{value}"))
+            .unwrap_or_else(|_| "Detached HEAD".into())
+    });
+    let branches = git_checked(
+        cwd,
+        &[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname:short)",
+            "refs/heads",
+        ],
+    )?
+    .lines()
+    .map(ToOwned::to_owned)
+    .collect();
+    let dirty = !git_checked(cwd, &["status", "--porcelain", "--untracked-files=normal"])?
+        .is_empty();
+    let upstream =
+        git_checked(cwd, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
+            .ok()
+            .filter(|value| !value.is_empty());
+    let (ahead, behind) = upstream
+        .as_ref()
+        .and_then(|_| git_checked(cwd, &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]).ok())
+        .and_then(|counts| {
+            let mut values = counts.split_whitespace().filter_map(|value| value.parse().ok());
+            Some((values.next()?, values.next()?))
+        })
+        .unwrap_or((0, 0));
+    Ok(GitStatusView {
+        available: true,
+        branch,
+        head,
+        branches,
+        dirty,
+        ahead,
+        behind,
+        has_upstream: upstream.is_some(),
+        upstream,
+    })
+}
+
+fn switch_git_branch_for_path(cwd: &Path, branch: &str) -> Result<GitStatusView, String> {
+    let status = git_status_for_path(cwd)?;
+    if !status.available {
+        return Err("Project is not a Git repository.".into());
+    }
+    if !status.branches.iter().any(|candidate| candidate == branch) {
+        return Err("Unknown local branch.".into());
+    }
+    git_checked(cwd, &["switch", "--", branch])?;
+    git_status_for_path(cwd)
+}
+
+fn pull_git_for_path(cwd: &Path) -> Result<GitStatusView, String> {
+    let status = git_status_for_path(cwd)?;
+    if !status.available {
+        return Err("Project is not a Git repository.".into());
+    }
+    if !status.has_upstream {
+        return Err("Current branch has no upstream branch.".into());
+    }
+    git_checked(cwd, &["pull", "--ff-only"])?;
+    git_status_for_path(cwd)
+}
+
+fn push_git_for_path(cwd: &Path) -> Result<GitStatusView, String> {
+    let status = git_status_for_path(cwd)?;
+    if !status.available {
+        return Err("Project is not a Git repository.".into());
+    }
+    let branch = status
+        .branch
+        .as_deref()
+        .ok_or("Cannot push a detached HEAD.")?;
+    if status.has_upstream {
+        git_checked(cwd, &["push"])?;
+    } else {
+        let remotes = git_checked(cwd, &["remote"])?;
+        if !remotes.lines().any(|remote| remote == "origin") {
+            return Err("Current branch has no upstream and remote 'origin' is missing.".into());
+        }
+        git_checked(cwd, &["push", "--set-upstream", "origin", branch])?;
+    }
+    git_status_for_path(cwd)
 }
 
 fn codex_session_id(root_pid: Option<u32>) -> Option<String> {
@@ -1566,6 +1894,82 @@ fn reorder_projects(ids: Vec<String>, state: State<'_, RuntimeState>) -> Result<
     let mut store = state.store.lock().map_err(|error| error.to_string())?;
     reorder_project_records(&mut store.data.projects, &ids)?;
     store.save()
+}
+
+fn project_path(project_id: &str, state: &RuntimeState) -> Result<PathBuf, String> {
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    store
+        .data
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| PathBuf::from(&project.cwd))
+        .ok_or_else(|| "Project not found.".into())
+}
+
+#[tauri::command]
+fn get_git_status(
+    project_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<GitStatusView, String> {
+    git_status_for_path(&project_path(&project_id, &state)?)
+}
+
+#[tauri::command]
+fn switch_git_branch(
+    project_id: String,
+    branch: String,
+    state: State<'_, RuntimeState>,
+) -> Result<GitStatusView, String> {
+    switch_git_branch_for_path(&project_path(&project_id, &state)?, &branch)
+}
+
+#[tauri::command]
+fn pull_git(project_id: String, state: State<'_, RuntimeState>) -> Result<GitStatusView, String> {
+    pull_git_for_path(&project_path(&project_id, &state)?)
+}
+
+#[tauri::command]
+fn push_git(project_id: String, state: State<'_, RuntimeState>) -> Result<GitStatusView, String> {
+    push_git_for_path(&project_path(&project_id, &state)?)
+}
+
+#[tauri::command]
+fn get_repository(
+    project_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<RepositoryView, String> {
+    list_repository_path(&project_path(&project_id, &state)?)
+}
+
+#[tauri::command]
+fn read_repository_file(
+    project_id: String,
+    path: String,
+    state: State<'_, RuntimeState>,
+) -> Result<RepositoryFileView, String> {
+    read_repository_path(&project_path(&project_id, &state)?, &path)
+}
+
+#[tauri::command]
+fn open_project_in_editor(
+    project_id: String,
+    editor_command: String,
+    state: State<'_, RuntimeState>,
+) -> Result<(), String> {
+    let editor_command = editor_command.trim();
+    if editor_command.is_empty() {
+        return Err("Choose an editor in Settings first.".into());
+    }
+    let root = canonical_repository_root(&project_path(&project_id, &state)?)?;
+    let mut child = Command::new(editor_command)
+        .arg(root)
+        .spawn()
+        .map_err(|error| format!("Could not start {editor_command}: {error}"))?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -2218,6 +2622,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_projects,
+            get_git_status,
+            switch_git_branch,
+            pull_git,
+            push_git,
+            get_repository,
+            read_repository_file,
+            open_project_in_editor,
             set_compact_mode,
             open_chat_popout,
             close_chat_popout,
@@ -2336,6 +2747,104 @@ mod tests {
         );
         assert!(popout_window_label("../main").is_err());
         assert!(popout_window_label("").is_err());
+    }
+
+    #[test]
+    fn reads_and_switches_local_git_branches() {
+        let repository =
+            std::env::temp_dir().join(format!("agent-grid-git-{}", short_id()));
+        fs::create_dir_all(&repository).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "Agent Grid Test"],
+            vec!["config", "user.email", "agent-grid@example.invalid"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repository)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::write(repository.join("README"), "initial\n").unwrap();
+        for args in [
+            vec!["add", "README"],
+            vec!["commit", "-m", "initial"],
+            vec!["branch", "feature"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repository)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let status = git_status_for_path(&repository).unwrap();
+        assert!(status.available);
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.branches, ["feature", "main"]);
+        assert!(!status.dirty);
+        assert!(!status.has_upstream);
+
+        switch_git_branch_for_path(&repository, "feature").unwrap();
+        let switched = git_status_for_path(&repository).unwrap();
+        assert_eq!(switched.branch.as_deref(), Some("feature"));
+        fs::write(repository.join("README"), "changed\n").unwrap();
+        assert!(git_status_for_path(&repository).unwrap().dirty);
+        assert!(switch_git_branch_for_path(&repository, "../invalid").is_err());
+        let _ = fs::remove_dir_all(repository);
+    }
+
+    #[test]
+    fn pushes_and_fast_forward_pulls_with_a_local_remote() {
+        let root = std::env::temp_dir().join(format!("agent-grid-git-remote-{}", short_id()));
+        let repository = root.join("local");
+        let remote = root.join("remote.git");
+        let other = root.join("other");
+        fs::create_dir_all(&root).unwrap();
+        let run = |cwd: &Path, args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(cwd)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+
+        run(&root, &["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()]);
+        run(&root, &["init", "-b", "main", repository.to_str().unwrap()]);
+        run(&repository, &["config", "user.name", "Agent Grid Test"]);
+        run(&repository, &["config", "user.email", "agent-grid@example.invalid"]);
+        fs::write(repository.join("README"), "initial\n").unwrap();
+        run(&repository, &["add", "README"]);
+        run(&repository, &["commit", "-m", "initial"]);
+        run(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+
+        let pushed = push_git_for_path(&repository).unwrap();
+        assert!(pushed.has_upstream);
+        assert_eq!(pushed.upstream.as_deref(), Some("origin/main"));
+
+        run(&root, &["clone", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        run(&other, &["config", "user.name", "Agent Grid Test"]);
+        run(&other, &["config", "user.email", "agent-grid@example.invalid"]);
+        fs::write(other.join("README"), "remote change\n").unwrap();
+        run(&other, &["add", "README"]);
+        run(&other, &["commit", "-m", "remote change"]);
+        run(&other, &["push"]);
+
+        pull_git_for_path(&repository).unwrap();
+        assert_eq!(fs::read_to_string(repository.join("README")).unwrap(), "remote change\n");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2571,5 +3080,41 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&output.stdout).contains("tauri-agent-ready"));
+    }
+
+    #[test]
+    fn lists_repository_sources_and_documentation_without_generated_directories() {
+        let repository =
+            std::env::temp_dir().join(format!("agent-grid-repository-{}", short_id()));
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(repository.join("node_modules/package")).unwrap();
+        fs::write(repository.join("README.md"), "# Test\n").unwrap();
+        fs::write(repository.join("src/lib.rs"), "pub fn ready() {}\n").unwrap();
+        fs::write(
+            repository.join("node_modules/package/index.js"),
+            "generated\n",
+        )
+        .unwrap();
+
+        let listing = list_repository_path(&repository).unwrap();
+        assert!(!listing.truncated);
+        assert!(listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == "README.md" && entry.documentation));
+        assert!(listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == "src/lib.rs" && !entry.is_directory));
+        assert!(!listing
+            .entries
+            .iter()
+            .any(|entry| entry.path.starts_with("node_modules")));
+
+        let file = read_repository_path(&repository, "README.md").unwrap();
+        assert_eq!(file.content, "# Test\n");
+        assert!(file.documentation);
+        assert!(read_repository_path(&repository, "../outside").is_err());
+        let _ = fs::remove_dir_all(repository);
     }
 }

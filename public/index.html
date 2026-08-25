@@ -19,6 +19,7 @@
         <div class="topbar-actions">
           <button id="compact-mode-button" class="icon-button topbar-icon" aria-label="Enter compact view" aria-pressed="false" title="Compact view">▯</button>
           <button id="settings-button" class="icon-button topbar-icon" aria-label="Open settings" title="Settings">⚙</button>
+          <button id="repository-button" class="icon-button topbar-icon" aria-label="Browse repository" aria-pressed="false" title="Browse repository" disabled>&lt;/&gt;</button>
           <div class="grid-controls" aria-label="Tiling layout">
             <button id="auto-grid-button" class="grid-mode-button active" aria-label="Retile automatically" title="Retile automatically">⊞</button>
             <button id="fewer-columns-button" class="icon-button" title="Fewer columns">−</button>
@@ -38,6 +39,18 @@
               <span>Projects</span>
               <button id="new-project-button" class="sidebar-add" title="New project">＋</button>
             </div>
+            <section id="git-section" class="git-section" aria-label="Git controls">
+              <div class="git-controls">
+                <span class="git-branch-icon" aria-hidden="true">⑂</span>
+                <select id="git-branch-select" aria-label="Current Git branch" disabled>
+                  <option>No project</option>
+                </select>
+                <button id="git-refresh-button" class="icon-button git-action" aria-label="Refresh Git status" title="Refresh Git status" disabled>↻</button>
+                <button id="git-pull-button" class="icon-button git-action" aria-label="Pull current branch" title="Pull current branch" disabled>↓</button>
+                <button id="git-push-button" class="icon-button git-action" aria-label="Push current branch" title="Push current branch" disabled>↑</button>
+              </div>
+              <div id="git-summary" class="git-summary">No project selected</div>
+            </section>
             <nav id="project-list" class="project-list" aria-label="Projects"></nav>
           </section>
           <div
@@ -71,6 +84,45 @@
           tabindex="0"
         ></div>
         <main id="terminal-grid" class="terminal-grid" aria-live="polite"></main>
+        <section id="repository-browser" class="repository-browser" aria-label="Repository browser" hidden>
+          <header class="repository-toolbar">
+            <div class="repository-heading">
+              <span class="repository-mark" aria-hidden="true">{ }</span>
+              <div>
+                <p class="eyebrow">Repository</p>
+                <strong id="repository-project-name">Project files</strong>
+              </div>
+            </div>
+            <div class="repository-actions">
+              <button id="repository-open-editor-button" class="button ghost" type="button">Open in <span id="repository-editor-label">VS Code</span></button>
+              <button id="repository-refresh-button" class="icon-button" type="button" aria-label="Refresh repository" title="Refresh repository">↻</button>
+              <button id="repository-close-button" class="icon-button" type="button" aria-label="Close repository browser" title="Close repository browser">×</button>
+            </div>
+          </header>
+          <div class="repository-navigator">
+            <div class="repository-tabs" role="group" aria-label="Repository view">
+              <button type="button" class="active" data-repository-filter="all">Files</button>
+              <button type="button" data-repository-filter="documentation">Docs</button>
+            </div>
+            <div id="repository-tree" class="repository-tree" role="tree" aria-label="Repository files"></div>
+            <p id="repository-limit-note" class="repository-limit-note" hidden>Showing the first 5,000 files.</p>
+          </div>
+          <article class="repository-preview">
+            <header class="repository-filebar">
+              <div>
+                <strong id="repository-file-path">Choose a file</strong>
+                <small id="repository-file-meta">Select source code or documentation from the repository.</small>
+              </div>
+              <button id="repository-copy-button" class="button ghost" type="button" hidden>Copy</button>
+            </header>
+            <div id="repository-preview-empty" class="repository-preview-empty">
+              <span aria-hidden="true">⌁</span>
+              <strong>Read the repository without leaving your agents</strong>
+              <p>Use Files for the complete source tree or Docs for README, agent instructions, and project notes.</p>
+            </div>
+            <pre id="repository-file-content" class="repository-file-content" tabindex="0" hidden><code></code></pre>
+          </article>
+        </section>
         <aside id="activity-panel" class="activity-panel" aria-label="Window activity" aria-hidden="true">
           <div class="activity-panel-header">
             <div>
@@ -178,6 +230,19 @@
           <input id="terminal-font-size-range" type="range" min="8" max="24" step="1" value="11">
           <small>Use Ctrl++ and Ctrl+- from a terminal at any time.</small>
         </label>
+        <label class="setting-control">
+          <span><strong>Preferred code editor</strong></span>
+          <select id="preferred-editor-select">
+            <option value="code">Visual Studio Code</option>
+            <option value="cursor">Cursor</option>
+            <option value="zed">Zed</option>
+            <option value="subl">Sublime Text</option>
+            <option value="idea">IntelliJ IDEA</option>
+            <option value="custom">Custom executable</option>
+          </select>
+          <input id="preferred-editor-custom" type="text" placeholder="/path/to/editor" spellcheck="false" hidden>
+          <small>Projects open as folders. Custom values must be an executable name or absolute path, without arguments.</small>
+        </label>
         <div class="modal-actions">
           <button type="button" class="button primary dialog-close">Done</button>
         </div>
@@ -186,6 +251,8 @@
 
     <div id="project-context-menu" class="context-menu" role="menu" hidden>
       <button type="button" role="menuitem" data-context-action="edit-project">Edit project settings</button>
+      <button type="button" role="menuitem" data-context-action="browse-repository">Browse repository</button>
+      <button type="button" role="menuitem" data-context-action="open-editor">Open in preferred editor</button>
     </div>
 
     <div id="toast" class="toast" role="status"></div>
