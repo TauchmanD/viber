@@ -17,6 +17,7 @@ use uuid::Uuid;
 const TIMELINE_MAX_EVENTS: usize = 500;
 const TIMELINE_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const INTERACTION_RUNNING_TTL_MS: u64 = 10_000;
+const GIT_GRAPH_LIMIT: usize = 500;
 const REPOSITORY_ENTRY_LIMIT: usize = 5_000;
 const REPOSITORY_FILE_LIMIT: u64 = 1024 * 1024;
 
@@ -258,6 +259,47 @@ struct GitStatusView {
     behind: u32,
     has_upstream: bool,
     upstream: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitGraphCommitView {
+    hash: String,
+    short_hash: String,
+    parents: Vec<String>,
+    refs: Vec<String>,
+    author: String,
+    date: String,
+    subject: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitGraphView {
+    commits: Vec<GitGraphCommitView>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitChangedFileView {
+    status: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCommitDetailView {
+    hash: String,
+    short_hash: String,
+    parents: Vec<String>,
+    refs: Vec<String>,
+    author: String,
+    date: String,
+    subject: String,
+    body: String,
+    stats: String,
+    files: Vec<GitChangedFileView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1463,6 +1505,135 @@ fn push_git_for_path(cwd: &Path) -> Result<GitStatusView, String> {
     git_status_for_path(cwd)
 }
 
+fn git_refs_for_commit(cwd: &Path, hash: &str) -> Result<Vec<String>, String> {
+    Ok(git_checked(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "--points-at",
+            hash,
+        ],
+    )?
+    .lines()
+    .filter(|reference| !reference.is_empty())
+    .map(ToOwned::to_owned)
+    .collect())
+}
+
+fn parse_git_graph_output(output: &str) -> GitGraphView {
+    let mut commits = output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(6, '\t');
+            let hash = fields.next()?.to_owned();
+            let parents = fields
+                .next()?
+                .split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect();
+            let refs = fields
+                .next()?
+                .split(", ")
+                .filter(|reference| !reference.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            let author = fields.next()?.to_owned();
+            let date = fields.next()?.to_owned();
+            let subject = fields.next()?.to_owned();
+            Some(GitGraphCommitView {
+                short_hash: hash.chars().take(7).collect(),
+                hash,
+                parents,
+                refs,
+                author,
+                date,
+                subject,
+            })
+        })
+        .collect::<Vec<_>>();
+    let truncated = commits.len() > GIT_GRAPH_LIMIT;
+    if truncated {
+        commits.truncate(GIT_GRAPH_LIMIT);
+    }
+    GitGraphView { commits, truncated }
+}
+
+fn git_graph_for_path(cwd: &Path) -> Result<GitGraphView, String> {
+    if !git_status_for_path(cwd)?.available {
+        return Err("Project is not a Git repository.".into());
+    }
+    let limit = format!("--max-count={}", GIT_GRAPH_LIMIT + 1);
+    let output = git_checked(
+        cwd,
+        &[
+            "log",
+            "--all",
+            "--topo-order",
+            "--decorate=short",
+            &limit,
+            "--pretty=format:%H%x09%P%x09%D%x09%an%x09%aI%x09%s",
+        ],
+    )?;
+    Ok(parse_git_graph_output(&output))
+}
+
+fn git_commit_detail_for_path(cwd: &Path, hash: &str) -> Result<GitCommitDetailView, String> {
+    if !(7..=40).contains(&hash.len()) || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Invalid commit hash.".into());
+    }
+    let metadata = git_checked(cwd, &["show", "-s", "--format=%H%n%P%n%an%n%aI%n%s", hash])?;
+    let mut lines = metadata.lines();
+    let resolved_hash = lines.next().ok_or("Commit not found.")?.to_owned();
+    let parents = lines
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect();
+    let author = lines.next().unwrap_or_default().to_owned();
+    let date = lines.next().unwrap_or_default().to_owned();
+    let subject = lines.next().unwrap_or_default().to_owned();
+    let body = git_checked(cwd, &["show", "-s", "--format=%B", &resolved_hash])?;
+    let stats = git_checked(cwd, &["show", "--format=", "--shortstat", &resolved_hash])?;
+    let files = git_checked(
+        cwd,
+        &[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            &resolved_hash,
+        ],
+    )?
+    .lines()
+    .filter_map(|line| {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        Some(GitChangedFileView {
+            status: fields.first()?.to_string(),
+            path: if fields.len() > 2 {
+                format!("{} → {}", fields[1], fields.last()?)
+            } else {
+                fields.get(1)?.to_string()
+            },
+        })
+    })
+    .collect();
+    Ok(GitCommitDetailView {
+        short_hash: resolved_hash.chars().take(7).collect(),
+        refs: git_refs_for_commit(cwd, &resolved_hash)?,
+        hash: resolved_hash,
+        parents,
+        author,
+        date,
+        subject,
+        body,
+        stats,
+        files,
+    })
+}
+
 fn codex_session_id(root_pid: Option<u32>) -> Option<String> {
     let root_pid = root_pid?;
     for pid in process_tree(root_pid) {
@@ -1951,6 +2122,23 @@ fn pull_git(project_id: String, state: State<'_, RuntimeState>) -> Result<GitSta
 #[tauri::command]
 fn push_git(project_id: String, state: State<'_, RuntimeState>) -> Result<GitStatusView, String> {
     push_git_for_path(&project_path(&project_id, &state)?)
+}
+
+#[tauri::command]
+fn get_git_graph(
+    project_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<GitGraphView, String> {
+    git_graph_for_path(&project_path(&project_id, &state)?)
+}
+
+#[tauri::command]
+fn get_git_commit(
+    project_id: String,
+    hash: String,
+    state: State<'_, RuntimeState>,
+) -> Result<GitCommitDetailView, String> {
+    git_commit_detail_for_path(&project_path(&project_id, &state)?, &hash)
 }
 
 #[tauri::command]
@@ -2645,6 +2833,8 @@ pub fn run() {
             switch_git_branch,
             pull_git,
             push_git,
+            get_git_graph,
+            get_git_commit,
             get_repository,
             read_repository_file,
             open_project_in_editor,
@@ -2810,8 +3000,52 @@ mod tests {
         assert_eq!(switched.branch.as_deref(), Some("feature"));
         fs::write(repository.join("README"), "changed\n").unwrap();
         assert!(git_status_for_path(&repository).unwrap().dirty);
+        for args in [
+            vec!["add", "README"],
+            vec!["commit", "-m", "feature change"],
+        ] {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let graph = git_graph_for_path(&repository).unwrap();
+        assert_eq!(graph.commits.len(), 2);
+        assert!(!graph.truncated);
+        assert_eq!(graph.commits[0].subject, "feature change");
+        assert!(graph.commits[0]
+            .refs
+            .iter()
+            .any(|reference| reference.contains("feature")));
+        assert_eq!(graph.commits[0].parents, [graph.commits[1].hash.clone()]);
+        let detail = git_commit_detail_for_path(&repository, &graph.commits[0].hash).unwrap();
+        assert_eq!(detail.subject, "feature change");
+        assert_eq!(detail.files[0].status, "M");
+        assert_eq!(detail.files[0].path, "README");
+        assert!(git_commit_detail_for_path(&repository, "../invalid").is_err());
         assert!(switch_git_branch_for_path(&repository, "../invalid").is_err());
         let _ = fs::remove_dir_all(repository);
+    }
+
+    #[test]
+    fn parses_and_limits_git_graph_output() {
+        let output = (0..=GIT_GRAPH_LIMIT)
+            .map(|index| {
+                format!(
+                    "{index:040x}\t\tbranch-{index}\tAuthor\t2026-08-25T10:00:00Z\tCommit {index}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let graph = parse_git_graph_output(&output);
+        assert_eq!(graph.commits.len(), GIT_GRAPH_LIMIT);
+        assert!(graph.truncated);
+        assert_eq!(graph.commits[0].short_hash, "0000000");
+        assert_eq!(graph.commits[0].refs, ["branch-0"]);
+        assert_eq!(graph.commits[0].subject, "Commit 0");
     }
 
     #[test]
@@ -3122,6 +3356,7 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
         fs::create_dir_all(repository.join("node_modules/package")).unwrap();
         fs::write(repository.join("README.md"), "# Test\n").unwrap();
         fs::write(repository.join("src/lib.rs"), "pub fn ready() {}\n").unwrap();
+        fs::write(repository.join("Dockerfile"), "FROM scratch\n").unwrap();
         fs::write(
             repository.join("node_modules/package/index.js"),
             "generated\n",
@@ -3138,6 +3373,10 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             .entries
             .iter()
             .any(|entry| entry.path == "src/lib.rs" && !entry.is_directory));
+        assert!(listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == "Dockerfile" && !entry.is_directory));
         assert!(!listing
             .entries
             .iter()

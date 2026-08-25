@@ -1,4 +1,4 @@
-/* global Terminal, FitAddon, UiLayout */
+/* global Terminal, FitAddon, UiLayout, marked, DOMPurify */
 
 const { invoke, Channel } = window.__TAURI__.core;
 const tauriListen = window.__TAURI__.event?.listen;
@@ -38,8 +38,13 @@ const activityTimeline = document.querySelector("#activity-timeline");
 const activityPanelPorts = document.querySelector("#activity-panel-ports");
 const repositoryBrowser = document.querySelector("#repository-browser");
 const repositoryTree = document.querySelector("#repository-tree");
+const gitGraph = document.querySelector("#git-graph");
+const gitGraphLimitNote = document.querySelector("#git-graph-limit-note");
+const gitCommitPreview = document.querySelector("#git-commit-preview");
 const repositoryFileContent = document.querySelector("#repository-file-content");
 const repositoryPreviewEmpty = document.querySelector("#repository-preview-empty");
+const repositoryMarkdownPreview = document.querySelector("#repository-markdown-preview");
+const markdownViewToggle = document.querySelector("#markdown-view-toggle");
 const repositoryCopyButton = document.querySelector("#repository-copy-button");
 const preferredEditorSelect = document.querySelector("#preferred-editor-select");
 const preferredEditorCustom = document.querySelector("#preferred-editor-custom");
@@ -92,6 +97,11 @@ let repositoryProjectId = null;
 let repositoryFilter = "all";
 let repositoryTruncated = false;
 let collapsedRepositoryPaths = new Set();
+let markdownView = "preview";
+let gitGraphCommits = [];
+let gitGraphTruncated = false;
+let gitGraphProjectId = null;
+let selectedGitCommitHash = null;
 
 const activityQuietMs = 5000;
 
@@ -959,6 +969,39 @@ function repositoryAncestors(path) {
   return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
 }
 
+function markdownPath(path) {
+  const name = path.split("/").pop().toLowerCase();
+  const extension = name.includes(".") ? name.split(".").pop() : "";
+  return ["md", "mdx", "markdown"].includes(extension)
+    || ["readme", "changelog", "contributing", "agents", "claude"].includes(name);
+}
+
+function updateRepositoryFileView() {
+  const markdown = Boolean(repositoryFile && markdownPath(repositoryFile.path));
+  const preview = markdown && markdownView === "preview";
+  markdownViewToggle.hidden = !markdown;
+  repositoryMarkdownPreview.hidden = !preview;
+  repositoryFileContent.hidden = !repositoryFile || preview;
+  gitCommitPreview.hidden = true;
+  document.querySelectorAll("[data-markdown-view]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.markdownView === markdownView);
+  });
+}
+
+function replaceBrokenMarkdownImage(image) {
+  const replacement = document.createElement("span");
+  replacement.className = "markdown-image-placeholder";
+  replacement.textContent = image.alt ? `Image: ${image.alt}` : "Image unavailable";
+  image.replaceWith(replacement);
+}
+
+function watchMarkdownImages() {
+  repositoryMarkdownPreview.querySelectorAll("img").forEach((image) => {
+    image.addEventListener("error", () => replaceBrokenMarkdownImage(image), { once: true });
+    if (image.complete && image.naturalWidth === 0) replaceBrokenMarkdownImage(image);
+  });
+}
+
 function renderRepositoryTree() {
   let entries;
   if (repositoryFilter === "documentation") {
@@ -984,16 +1027,255 @@ function renderRepositoryTree() {
   document.querySelector("#repository-limit-note").hidden = !repositoryTruncated;
 }
 
+const gitLaneColors = [
+  "#79d99d",
+  "#68a7e8",
+  "#e2b95f",
+  "#ff7a90",
+  "#a58bd8",
+  "#55c2c8",
+  "#f08db5",
+  "#9fc46b",
+];
+
+function gitColor(value, fallback = 0) {
+  let hash = 0;
+  for (const character of value || String(fallback)) {
+    hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  }
+  return gitLaneColors[Math.abs(hash) % gitLaneColors.length];
+}
+
+function gitRefLabel(reference) {
+  return reference.replace(/^HEAD -> /, "").replace(/^tag: /, "");
+}
+
+function gitRefColor(reference) {
+  const label = gitRefLabel(reference);
+  const key = label.startsWith("tag:") ? label : label.split("/").at(-1);
+  return gitColor(key);
+}
+
+function gitRefTemplate(reference) {
+  const color = gitRefColor(reference);
+  return `<span class="git-ref" style="color:${color}" title="${escapeHtml(reference)}">${escapeHtml(gitRefLabel(reference))}</span>`;
+}
+
+function layoutGitCommits(commits) {
+  const lanes = [];
+  return commits.map((commit) => {
+    let lane = lanes.indexOf(commit.hash);
+    if (lane < 0) {
+      lane = lanes.findIndex((value) => !value);
+      if (lane < 0) lane = lanes.length;
+      lanes[lane] = commit.hash;
+    }
+    const before = lanes.slice();
+    const parentLanes = [];
+    if (!commit.parents.length) {
+      lanes[lane] = null;
+    } else {
+      const firstParent = commit.parents[0];
+      const existingFirst = lanes.indexOf(firstParent);
+      if (existingFirst >= 0 && existingFirst !== lane) {
+        lanes[lane] = null;
+        parentLanes.push(existingFirst);
+      } else {
+        lanes[lane] = firstParent;
+        parentLanes.push(lane);
+      }
+      for (const parent of commit.parents.slice(1)) {
+        let target = lanes.indexOf(parent);
+        if (target < 0) {
+          target = lanes.findIndex((value) => !value);
+          if (target < 0) target = lanes.length;
+          lanes[target] = parent;
+        }
+        parentLanes.push(target);
+      }
+    }
+    for (let index = 0; index < lanes.length; index += 1) {
+      if (lanes[index] && lanes.indexOf(lanes[index]) !== index) lanes[index] = null;
+    }
+    while (lanes.length && lanes.at(-1) == null) lanes.pop();
+    return {
+      commit,
+      lane,
+      before,
+      after: lanes.slice(),
+      parentLanes,
+      laneCount: Math.max(before.length, lanes.length, lane + 1),
+    };
+  });
+}
+
+function gitGraphSvg(layout) {
+  const step = 14;
+  const padding = 8;
+  const centerY = 23;
+  const height = 46;
+  const x = (lane) => padding + lane * step;
+  const paths = [];
+  for (let lane = 0; lane < layout.laneCount; lane += 1) {
+    if (lane === layout.lane) continue;
+    if (layout.before[lane] || layout.after[lane]) {
+      paths.push(`<path d="M${x(lane)} 0 V${height}" stroke="${gitLaneColors[lane % gitLaneColors.length]}" />`);
+    }
+  }
+  const currentColor = layout.commit.refs.length
+    ? gitRefColor(layout.commit.refs[0])
+    : gitLaneColors[layout.lane % gitLaneColors.length];
+  paths.push(`<path d="M${x(layout.lane)} 0 V${centerY}" stroke="${currentColor}" />`);
+  for (const parentLane of layout.parentLanes) {
+    const targetColor = gitLaneColors[parentLane % gitLaneColors.length];
+    paths.push(`<path d="M${x(layout.lane)} ${centerY} C${x(layout.lane)} 35 ${x(parentLane)} 34 ${x(parentLane)} ${height}" stroke="${targetColor}" />`);
+  }
+  paths.push(`<circle cx="${x(layout.lane)}" cy="${centerY}" r="5" fill="${currentColor}" stroke="#08090b" stroke-width="2" />`);
+  const width = padding * 2 + Math.max(1, layout.laneCount) * step;
+  return `<svg class="git-graph-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-hidden="true">${paths.join("")}</svg>`;
+}
+
+function renderGitGraph() {
+  const layouts = layoutGitCommits(gitGraphCommits);
+  gitGraph.innerHTML = layouts.length ? layouts.map((layout) => {
+    const commit = layout.commit;
+    const date = Number.isNaN(Date.parse(commit.date))
+      ? commit.date
+      : new Date(commit.date).toLocaleString();
+    return `<button type="button" class="git-commit-row ${commit.hash === selectedGitCommitHash ? "selected" : ""}" role="listitem" data-git-commit="${commit.hash}">
+      ${gitGraphSvg(layout)}
+      <span class="git-commit-copy">
+        ${commit.refs.length ? `<span class="git-ref-list">${commit.refs.map(gitRefTemplate).join("")}</span>` : ""}
+        <span class="git-commit-subject">${escapeHtml(commit.subject)}</span>
+        <span class="git-commit-meta">${escapeHtml(commit.shortHash)} · ${escapeHtml(commit.author)} · ${escapeHtml(date)}</span>
+      </span>
+    </button>`;
+  }).join("") : `<div class="repository-tree-empty">No commits found.</div>`;
+  gitGraphLimitNote.hidden = !gitGraphTruncated;
+}
+
+function showGitCommitPreview(detail) {
+  repositoryFile = null;
+  selectedGitCommitHash = detail.hash;
+  repositoryFileContent.hidden = true;
+  repositoryMarkdownPreview.hidden = true;
+  repositoryPreviewEmpty.hidden = true;
+  markdownViewToggle.hidden = true;
+  repositoryCopyButton.hidden = true;
+  gitCommitPreview.hidden = false;
+  document.querySelector("#repository-file-path").textContent =
+    `${detail.shortHash} · ${detail.subject}`;
+  document.querySelector("#repository-file-meta").textContent =
+    `${detail.author} · ${new Date(detail.date).toLocaleString()}`;
+  document.querySelector("#git-commit-refs").innerHTML =
+    detail.refs.map(gitRefTemplate).join("");
+  document.querySelector("#git-commit-body").textContent = detail.body;
+  document.querySelector("#git-commit-hash").textContent = detail.hash;
+  document.querySelector("#git-commit-parents").textContent =
+    detail.parents.length ? detail.parents.map((parent) => parent.slice(0, 7)).join(", ") : "Root commit";
+  document.querySelector("#git-commit-author").textContent = detail.author;
+  document.querySelector("#git-commit-date").textContent =
+    Number.isNaN(Date.parse(detail.date)) ? detail.date : new Date(detail.date).toLocaleString();
+  document.querySelector("#git-commit-stats").textContent = detail.stats || "No file changes";
+  document.querySelector("#git-commit-files").innerHTML = detail.files.map((file) =>
+    `<div class="git-changed-file"><span class="git-file-status">${escapeHtml(file.status)}</span><span>${escapeHtml(file.path)}</span></div>`
+  ).join("");
+  renderGitGraph();
+}
+
+async function readGitCommit(hash) {
+  const project = activeProject();
+  if (!project || repositoryFilter !== "git") return;
+  const projectId = project.id;
+  selectedGitCommitHash = hash;
+  renderGitGraph();
+  document.querySelector("#repository-file-path").textContent = hash.slice(0, 7);
+  document.querySelector("#repository-file-meta").textContent = "Loading commit…";
+  try {
+    const detail = await call("get_git_commit", { projectId, hash });
+    if (activeProjectId !== projectId || repositoryFilter !== "git" || repositoryBrowser.hidden) return;
+    showGitCommitPreview(detail);
+  } catch (error) {
+    showRepositoryPreview("Commit unavailable", error.message, true);
+  }
+}
+
+async function refreshGitGraph() {
+  const project = activeProject();
+  if (!project) return;
+  const projectId = project.id;
+  repositoryProjectId = projectId;
+  gitGraphProjectId = projectId;
+  selectedGitCommitHash = null;
+  gitGraphCommits = [];
+  showRepositoryPreview("Git history", "Select a commit to inspect its details.");
+  gitGraph.innerHTML = `<div class="repository-tree-empty">Reading Git history…</div>`;
+  try {
+    const graph = await call("get_git_graph", { projectId });
+    if (activeProjectId !== projectId || repositoryFilter !== "git" || repositoryBrowser.hidden) return;
+    gitGraphCommits = graph.commits;
+    gitGraphTruncated = graph.truncated;
+    renderGitGraph();
+    if (gitGraphCommits[0]) await readGitCommit(gitGraphCommits[0].hash);
+  } catch (error) {
+    gitGraphCommits = [];
+    gitGraphTruncated = false;
+    showRepositoryPreview("Git history unavailable", error.message, true);
+    gitGraph.innerHTML = `<div class="repository-tree-empty error">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function setRepositoryFilter(filter) {
+  repositoryFilter = filter;
+  const gitMode = filter === "git";
+  repositoryBrowser.classList.toggle("git-mode", gitMode);
+  document.querySelectorAll("[data-repository-filter]").forEach((item) => {
+    item.classList.toggle("active", item.dataset.repositoryFilter === filter);
+  });
+  repositoryTree.hidden = gitMode;
+  gitGraph.hidden = !gitMode;
+  document.querySelector("#repository-limit-note").hidden = gitMode || !repositoryTruncated;
+  gitGraphLimitNote.hidden = !gitMode || !gitGraphTruncated;
+  if (gitMode) {
+    if (gitGraphProjectId !== activeProjectId || !gitGraphCommits.length) {
+      await refreshGitGraph();
+    } else {
+      renderGitGraph();
+      if (selectedGitCommitHash) await readGitCommit(selectedGitCommitHash);
+      else showRepositoryPreview("Git history", "Select a commit to inspect its details.");
+    }
+  } else {
+    gitCommitPreview.hidden = true;
+    showRepositoryPreview(
+      "Choose a file",
+      filter === "documentation"
+        ? "Select project documentation from the list."
+        : "Select source code or documentation from the repository.",
+    );
+    renderRepositoryTree();
+  }
+}
+
+async function refreshRepositoryView() {
+  if (repositoryFilter === "git") await refreshGitGraph();
+  else await refreshRepository();
+}
+
 function showRepositoryPreview(title, message, isError = false) {
   repositoryFile = null;
   repositoryFileContent.hidden = true;
+  repositoryMarkdownPreview.hidden = true;
+  repositoryMarkdownPreview.replaceChildren();
+  markdownViewToggle.hidden = true;
   repositoryCopyButton.hidden = true;
+  gitCommitPreview.hidden = true;
   repositoryPreviewEmpty.hidden = false;
   repositoryPreviewEmpty.classList.toggle("error", isError);
   repositoryPreviewEmpty.innerHTML = `<span aria-hidden="true">${isError ? "!" : "⌁"}</span><strong>${escapeHtml(title)}</strong><p>${escapeHtml(message)}</p>`;
   document.querySelector("#repository-file-path").textContent = title;
   document.querySelector("#repository-file-meta").textContent = message;
-  renderRepositoryTree();
+  if (repositoryFilter === "git") renderGitGraph();
+  else renderRepositoryTree();
 }
 
 async function readRepositoryFile(path) {
@@ -1008,9 +1290,20 @@ async function readRepositoryFile(path) {
     repositoryFile = file;
     repositoryFileContent.querySelector("code").textContent = file.content;
     repositoryFileContent.classList.toggle("documentation", file.documentation);
-    repositoryFileContent.hidden = false;
+    markdownView = "preview";
+    if (markdownPath(file.path)) {
+      const rendered = marked.parse(file.content, { gfm: true });
+      repositoryMarkdownPreview.innerHTML = DOMPurify.sanitize(rendered, {
+        USE_PROFILES: { html: true },
+      });
+      watchMarkdownImages();
+    } else {
+      repositoryMarkdownPreview.replaceChildren();
+    }
     repositoryPreviewEmpty.hidden = true;
     repositoryCopyButton.hidden = false;
+    gitCommitPreview.hidden = true;
+    updateRepositoryFileView();
     document.querySelector("#repository-file-path").textContent = file.path;
     const lines = file.content ? file.content.split("\n").length : 0;
     document.querySelector("#repository-file-meta").textContent =
@@ -1036,9 +1329,7 @@ async function refreshRepository() {
     if (activeProjectId !== projectId || repositoryBrowser.hidden) return;
     repositoryEntries = repository.entries;
     repositoryTruncated = repository.truncated;
-    collapsedRepositoryPaths = new Set(repository.entries
-      .filter((entry) => entry.isDirectory)
-      .map((entry) => entry.path));
+    collapsedRepositoryPaths = new Set();
     renderRepositoryTree();
   } catch (error) {
     repositoryEntries = [];
@@ -1062,7 +1353,7 @@ async function openRepository(projectId = activeProjectId) {
   document.querySelector("#repository-button").classList.add("active");
   document.querySelector("#repository-button").setAttribute("aria-pressed", "true");
   updateEditorControls();
-  if (repositoryProjectId !== projectId) await refreshRepository();
+  if (repositoryProjectId !== projectId) await refreshRepositoryView();
 }
 
 function closeRepository() {
@@ -1221,7 +1512,7 @@ async function render() {
     maximizedWindowId = null;
     renderEmptyState();
     if (workspace.classList.contains("activity-open")) await refreshTimeline();
-    if (repositoryNeedsRefresh) await refreshRepository();
+    if (repositoryNeedsRefresh) await refreshRepositoryView();
     return;
   }
   if (!windows.some((window) => window.id === selectedWindowId)) selectedWindowId = windows[0].id;
@@ -1231,7 +1522,7 @@ async function render() {
   grid.classList.toggle("has-maximized", Boolean(maximizedWindowId));
   await Promise.all(windows.map(connectTerminal));
   if (workspace.classList.contains("activity-open")) await refreshTimeline();
-  if (repositoryNeedsRefresh) await refreshRepository();
+  if (repositoryNeedsRefresh) await refreshRepositoryView();
 }
 
 async function refreshProjects({ quiet = false } = {}) {
@@ -1358,6 +1649,7 @@ async function runGitOperation(command, args, successMessage) {
       gitStatusProjectId = projectId;
       gitStatusError = null;
       showToast(successMessage);
+      if (!repositoryBrowser.hidden && repositoryFilter === "git") await refreshGitGraph();
     }
   } catch (error) {
     showToast(`Git operation failed: ${error.message}`, true);
@@ -1609,7 +1901,7 @@ document.querySelector("#repository-button").addEventListener("click", () => {
   else closeRepository();
 });
 document.querySelector("#repository-close-button").addEventListener("click", closeRepository);
-document.querySelector("#repository-refresh-button").addEventListener("click", refreshRepository);
+document.querySelector("#repository-refresh-button").addEventListener("click", refreshRepositoryView);
 document.querySelector("#repository-open-editor-button").addEventListener("click", () => openProjectInEditor());
 repositoryCopyButton.addEventListener("click", () => {
   if (repositoryFile) copyText(repositoryFile.content, `${repositoryFile.path} copied.`);
@@ -1617,9 +1909,7 @@ repositoryCopyButton.addEventListener("click", () => {
 document.querySelector(".repository-tabs").addEventListener("click", (event) => {
   const button = event.target.closest("[data-repository-filter]");
   if (!button) return;
-  repositoryFilter = button.dataset.repositoryFilter;
-  document.querySelectorAll("[data-repository-filter]").forEach((item) => item.classList.toggle("active", item === button));
-  renderRepositoryTree();
+  setRepositoryFilter(button.dataset.repositoryFilter);
 });
 repositoryTree.addEventListener("click", (event) => {
   const path = event.target.closest("[data-repository-path]")?.dataset.repositoryPath;
@@ -1633,6 +1923,24 @@ repositoryTree.addEventListener("click", (event) => {
   } else {
     readRepositoryFile(path);
   }
+});
+gitGraph.addEventListener("click", (event) => {
+  const hash = event.target.closest("[data-git-commit]")?.dataset.gitCommit;
+  if (hash) readGitCommit(hash);
+});
+markdownViewToggle.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-markdown-view]");
+  if (!button || !repositoryFile || !markdownPath(repositoryFile.path)) return;
+  markdownView = button.dataset.markdownView;
+  updateRepositoryFileView();
+});
+repositoryMarkdownPreview.addEventListener("click", (event) => {
+  const link = event.target.closest("a[href]");
+  if (!link || link.getAttribute("href").startsWith("#")) return;
+  event.preventDefault();
+  const href = link.href;
+  if (/^https?:/.test(href)) openPort(href);
+  else showToast("Open local Markdown links from the file tree.");
 });
 preferredEditorSelect.addEventListener("change", () => {
   preferredEditor = preferredEditorSelect.value;

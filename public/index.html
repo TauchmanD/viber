@@ -39,18 +39,6 @@
               <span>Projects</span>
               <button id="new-project-button" class="sidebar-add" title="New project">＋</button>
             </div>
-            <section id="git-section" class="git-section" aria-label="Git controls">
-              <div class="git-controls">
-                <span class="git-branch-icon" aria-hidden="true">⑂</span>
-                <select id="git-branch-select" aria-label="Current Git branch" disabled>
-                  <option>No project</option>
-                </select>
-                <button id="git-refresh-button" class="icon-button git-action" aria-label="Refresh Git status" title="Refresh Git status" disabled>↻</button>
-                <button id="git-pull-button" class="icon-button git-action" aria-label="Pull current branch" title="Pull current branch" disabled>↓</button>
-                <button id="git-push-button" class="icon-button git-action" aria-label="Push current branch" title="Push current branch" disabled>↑</button>
-              </div>
-              <div id="git-summary" class="git-summary">No project selected</div>
-            </section>
             <nav id="project-list" class="project-list" aria-label="Projects"></nav>
           </section>
           <div
@@ -67,6 +55,18 @@
               <span id="window-count" class="count">0</span>
             </div>
             <nav id="window-list" class="agent-list" aria-label="Terminal windows"></nav>
+          </section>
+          <section id="git-section" class="git-section" aria-label="Git controls">
+            <div class="git-controls">
+              <span class="git-branch-icon" aria-hidden="true">⑂</span>
+              <select id="git-branch-select" aria-label="Current Git branch" disabled>
+                <option>No project</option>
+              </select>
+              <button id="git-refresh-button" class="icon-button git-action" aria-label="Refresh Git status" title="Refresh Git status" disabled>↻</button>
+              <button id="git-pull-button" class="icon-button git-action" aria-label="Pull current branch" title="Pull current branch" disabled>↓</button>
+              <button id="git-push-button" class="icon-button git-action" aria-label="Push current branch" title="Push current branch" disabled>↑</button>
+            </div>
+            <div id="git-summary" class="git-summary">No project selected</div>
           </section>
           <div class="sidebar-footer">
             <span class="status-dot healthy"></span>
@@ -103,8 +103,11 @@
             <div class="repository-tabs" role="group" aria-label="Repository view">
               <button type="button" class="active" data-repository-filter="all">Files</button>
               <button type="button" data-repository-filter="documentation">Docs</button>
+              <button type="button" data-repository-filter="git">Git</button>
             </div>
             <div id="repository-tree" class="repository-tree" role="tree" aria-label="Repository files"></div>
+            <div id="git-graph" class="git-graph" role="list" aria-label="Git commit graph" hidden></div>
+            <p id="git-graph-limit-note" class="repository-limit-note" hidden>Showing the most recent 500 commits.</p>
             <p id="repository-limit-note" class="repository-limit-note" hidden>Showing the first 5,000 files.</p>
           </div>
           <article class="repository-preview">
@@ -113,7 +116,13 @@
                 <strong id="repository-file-path">Choose a file</strong>
                 <small id="repository-file-meta">Select source code or documentation from the repository.</small>
               </div>
-              <button id="repository-copy-button" class="button ghost" type="button" hidden>Copy</button>
+              <div class="repository-file-actions">
+                <div id="markdown-view-toggle" class="markdown-view-toggle" role="group" aria-label="Markdown view" hidden>
+                  <button type="button" class="active" data-markdown-view="preview">Preview</button>
+                  <button type="button" data-markdown-view="source">Source</button>
+                </div>
+                <button id="repository-copy-button" class="button ghost" type="button" hidden>Copy</button>
+              </div>
             </header>
             <div id="repository-preview-empty" class="repository-preview-empty">
               <span aria-hidden="true">⌁</span>
@@ -121,6 +130,19 @@
               <p>Use Files for the complete source tree or Docs for README, agent instructions, and project notes.</p>
             </div>
             <pre id="repository-file-content" class="repository-file-content" tabindex="0" hidden><code></code></pre>
+            <article id="repository-markdown-preview" class="repository-markdown-preview" tabindex="0" hidden></article>
+            <article id="git-commit-preview" class="git-commit-preview" hidden>
+              <div id="git-commit-refs" class="git-commit-refs"></div>
+              <p id="git-commit-body" class="git-commit-body"></p>
+              <dl class="git-commit-metadata">
+                <div><dt>Commit</dt><dd><code id="git-commit-hash"></code></dd></div>
+                <div><dt>Parents</dt><dd id="git-commit-parents"></dd></div>
+                <div><dt>Author</dt><dd id="git-commit-author"></dd></div>
+                <div><dt>Date</dt><dd id="git-commit-date"></dd></div>
+                <div><dt>Changes</dt><dd id="git-commit-stats"></dd></div>
+              </dl>
+              <div id="git-commit-files" class="git-commit-files"></div>
+            </article>
           </article>
         </section>
         <aside id="activity-panel" class="activity-panel" aria-label="Window activity" aria-hidden="true">
@@ -258,6 +280,8 @@
     <div id="toast" class="toast" role="status"></div>
     <script src="./vendor/xterm.js"></script>
     <script src="./vendor/addon-fit.js"></script>
+    <script src="./vendor/marked.js"></script>
+    <script src="./vendor/purify.js"></script>
     <script src="./ui-layout.js"></script>
     <script src="./app.js"></script>
   </body>
