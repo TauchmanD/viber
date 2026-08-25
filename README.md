@@ -9,6 +9,8 @@ A Linux Tauri desktop application for organizing persistent tmux terminals and c
 - Project status squares show one color-coded state per open window: working, ready, needs input, attention, exited, or stopped.
 - OMP is the default coding-agent command. OMP status is read from its terminal breadcrumb and structured session log instead of inferred from terminal redraws.
 - The Git sidebar shows the current branch, local branches, working-tree changes, ahead/behind counts, branch switching, fast-forward pulls, and push/publish actions.
+- The repository browser opens from the top bar or project context menu, provides a collapsible source tree, and filters README, Markdown, agent instructions, and other documentation into a dedicated Docs view.
+- Each project row can launch its folder in the preferred editor. Visual Studio Code, Cursor, Zed, Sublime Text, IntelliJ IDEA, and a custom executable are configured under Settings.
 - Codex sessions retain explicit rollout-state detection and full-conversation handoff forks.
 - Every window runs in a persistent tmux session and survives closing the application.
 - Windows can be dragged, split, swapped, resized, maximized, automatically tiled, or popped into a separate native window.
