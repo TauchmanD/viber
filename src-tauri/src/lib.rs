@@ -739,9 +739,11 @@ fn omp_session_path(root_pid: u32) -> Option<PathBuf> {
         }) else {
             continue;
         };
-        let Ok(breadcrumb) =
-            fs::read_to_string(agent_directory.join("terminal-sessions").join(breadcrumb_id))
-        else {
+        let Ok(breadcrumb) = fs::read_to_string(
+            agent_directory
+                .join("terminal-sessions")
+                .join(breadcrumb_id),
+        ) else {
             continue;
         };
         let Some(session) = breadcrumb.lines().nth(1).map(str::trim) else {
@@ -781,7 +783,8 @@ fn omp_turn_state(path: &Path) -> Option<&'static str> {
                 };
                 match message.get("role").and_then(|value| value.as_str()) {
                     Some("toolResult") => {
-                        if let Some(id) = message.get("toolCallId").and_then(|value| value.as_str()) {
+                        if let Some(id) = message.get("toolCallId").and_then(|value| value.as_str())
+                        {
                             completed_tools.insert(id.to_owned());
                         }
                     }
@@ -1148,8 +1151,7 @@ fn collect_runtime_snapshots(
             ports: pane_pid.map(listening_ports).unwrap_or_default(),
             agent_busy,
         };
-        snapshot.activity_state =
-            omp_state.unwrap_or_else(|| activity_state(window, &snapshot));
+        snapshot.activity_state = omp_state.unwrap_or_else(|| activity_state(window, &snapshot));
         snapshots.insert(window.id.clone(), snapshot);
     }
     for window in windows {
@@ -1322,9 +1324,11 @@ fn git_checked(cwd: &Path, args: &[&str]) -> Result<String, String> {
             format!("git {} failed.", args.join(" "))
         });
     }
-    Ok(strip_control_sequences(&String::from_utf8_lossy(&output.stdout))
-        .trim()
-        .to_owned())
+    Ok(
+        strip_control_sequences(&String::from_utf8_lossy(&output.stdout))
+            .trim()
+            .to_owned(),
+    )
 }
 
 fn git_output(cwd: &str, args: &[&str]) -> String {
@@ -1372,17 +1376,32 @@ fn git_status_for_path(cwd: &Path) -> Result<GitStatusView, String> {
     .lines()
     .map(ToOwned::to_owned)
     .collect();
-    let dirty = !git_checked(cwd, &["status", "--porcelain", "--untracked-files=normal"])?
-        .is_empty();
-    let upstream =
-        git_checked(cwd, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
-            .ok()
-            .filter(|value| !value.is_empty());
+    let dirty =
+        !git_checked(cwd, &["status", "--porcelain", "--untracked-files=normal"])?.is_empty();
+    let upstream = git_checked(
+        cwd,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .ok()
+    .filter(|value| !value.is_empty());
     let (ahead, behind) = upstream
         .as_ref()
-        .and_then(|_| git_checked(cwd, &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]).ok())
+        .and_then(|_| {
+            git_checked(
+                cwd,
+                &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            )
+            .ok()
+        })
         .and_then(|counts| {
-            let mut values = counts.split_whitespace().filter_map(|value| value.parse().ok());
+            let mut values = counts
+                .split_whitespace()
+                .filter_map(|value| value.parse().ok());
             Some((values.next()?, values.next()?))
         })
         .unwrap_or((0, 0));
@@ -2723,19 +2742,17 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        reorder_project_records(
-            &mut projects,
-            &["c".into(), "a".into(), "b".into()],
-        )
-        .unwrap();
+        reorder_project_records(&mut projects, &["c".into(), "a".into(), "b".into()]).unwrap();
         assert_eq!(
-            projects.iter().map(|project| project.id.as_str()).collect::<Vec<_>>(),
+            projects
+                .iter()
+                .map(|project| project.id.as_str())
+                .collect::<Vec<_>>(),
             ["c", "a", "b"]
         );
         assert!(reorder_project_records(&mut projects, &["a".into(), "b".into()]).is_err());
         assert!(
-            reorder_project_records(&mut projects, &["a".into(), "a".into(), "c".into()])
-                .is_err()
+            reorder_project_records(&mut projects, &["a".into(), "a".into(), "c".into()]).is_err()
         );
     }
 
@@ -2751,23 +2768,20 @@ mod tests {
 
     #[test]
     fn reads_and_switches_local_git_branches() {
-        let repository =
-            std::env::temp_dir().join(format!("agent-grid-git-{}", short_id()));
+        let repository = std::env::temp_dir().join(format!("agent-grid-git-{}", short_id()));
         fs::create_dir_all(&repository).unwrap();
         for args in [
             vec!["init", "-b", "main"],
             vec!["config", "user.name", "Agent Grid Test"],
             vec!["config", "user.email", "agent-grid@example.invalid"],
         ] {
-            assert!(
-                Command::new("git")
-                    .arg("-C")
-                    .arg(&repository)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
         }
         fs::write(repository.join("README"), "initial\n").unwrap();
         for args in [
@@ -2775,15 +2789,13 @@ mod tests {
             vec!["commit", "-m", "initial"],
             vec!["branch", "feature"],
         ] {
-            assert!(
-                Command::new("git")
-                    .arg("-C")
-                    .arg(&repository)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
         }
 
         let status = git_status_for_path(&repository).unwrap();
@@ -2810,40 +2822,61 @@ mod tests {
         let other = root.join("other");
         fs::create_dir_all(&root).unwrap();
         let run = |cwd: &Path, args: &[&str]| {
-            assert!(
-                Command::new("git")
-                    .arg("-C")
-                    .arg(cwd)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
         };
 
-        run(&root, &["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()]);
+        run(
+            &root,
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
         run(&root, &["init", "-b", "main", repository.to_str().unwrap()]);
         run(&repository, &["config", "user.name", "Agent Grid Test"]);
-        run(&repository, &["config", "user.email", "agent-grid@example.invalid"]);
+        run(
+            &repository,
+            &["config", "user.email", "agent-grid@example.invalid"],
+        );
         fs::write(repository.join("README"), "initial\n").unwrap();
         run(&repository, &["add", "README"]);
         run(&repository, &["commit", "-m", "initial"]);
-        run(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run(
+            &repository,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
 
         let pushed = push_git_for_path(&repository).unwrap();
         assert!(pushed.has_upstream);
         assert_eq!(pushed.upstream.as_deref(), Some("origin/main"));
 
-        run(&root, &["clone", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        run(
+            &root,
+            &["clone", remote.to_str().unwrap(), other.to_str().unwrap()],
+        );
         run(&other, &["config", "user.name", "Agent Grid Test"]);
-        run(&other, &["config", "user.email", "agent-grid@example.invalid"]);
+        run(
+            &other,
+            &["config", "user.email", "agent-grid@example.invalid"],
+        );
         fs::write(other.join("README"), "remote change\n").unwrap();
         run(&other, &["add", "README"]);
         run(&other, &["commit", "-m", "remote change"]);
         run(&other, &["push"]);
 
         pull_git_for_path(&repository).unwrap();
-        assert_eq!(fs::read_to_string(repository.join("README")).unwrap(), "remote change\n");
+        assert_eq!(
+            fs::read_to_string(repository.join("README")).unwrap(),
+            "remote change\n"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3084,8 +3117,7 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
 
     #[test]
     fn lists_repository_sources_and_documentation_without_generated_directories() {
-        let repository =
-            std::env::temp_dir().join(format!("agent-grid-repository-{}", short_id()));
+        let repository = std::env::temp_dir().join(format!("agent-grid-repository-{}", short_id()));
         fs::create_dir_all(repository.join("src")).unwrap();
         fs::create_dir_all(repository.join("node_modules/package")).unwrap();
         fs::write(repository.join("README.md"), "# Test\n").unwrap();
