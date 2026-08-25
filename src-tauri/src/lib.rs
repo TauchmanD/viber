@@ -461,12 +461,81 @@ fn documentation_path(path: &Path) -> bool {
         || matches!(name.as_str(), "license" | "authors" | "agents" | "claude")
 }
 
+fn git_visible_repository_paths(
+    root: &Path,
+) -> Result<Option<(HashSet<PathBuf>, HashSet<PathBuf>)>, String> {
+    let probe = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+    let Ok(probe) = probe else {
+        return Ok(None);
+    };
+    if !probe.status.success() {
+        return Ok(None);
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+        .map_err(|error| format!("Could not read Git files: {error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if error.is_empty() {
+            "Could not read files allowed by .gitignore.".into()
+        } else {
+            error
+        });
+    }
+
+    let mut files = HashSet::new();
+    let mut directories = HashSet::new();
+    for raw_path in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = PathBuf::from(String::from_utf8_lossy(raw_path).into_owned());
+        if path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        if root.join(&path).is_dir() {
+            directories.insert(path);
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            for ancestor in parent
+                .ancestors()
+                .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            {
+                directories.insert(ancestor.to_path_buf());
+            }
+        }
+        files.insert(path);
+    }
+    Ok(Some((files, directories)))
+}
+
 fn collect_repository_entries(
     directory: &Path,
     relative_directory: &Path,
     depth: u16,
     entries: &mut Vec<RepositoryEntry>,
     truncated: &mut bool,
+    visible_files: Option<&HashSet<PathBuf>>,
+    visible_directories: Option<&HashSet<PathBuf>>,
 ) -> Result<(), String> {
     let mut children = fs::read_dir(directory)
         .map_err(|error| format!("Could not read {}: {error}", directory.display()))?
@@ -493,12 +562,18 @@ fn collect_repository_entries(
             return Ok(());
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if file_type.is_dir() && ignored_repository_directory(&name) {
+        let relative = relative_directory.join(&name);
+        let is_directory = file_type.is_dir();
+        if is_directory {
+            if visible_directories.is_some_and(|paths| !paths.contains(&relative))
+                || (visible_directories.is_none() && ignored_repository_directory(&name))
+            {
+                continue;
+            }
+        } else if visible_files.is_some_and(|paths| !paths.contains(&relative)) {
             continue;
         }
-        let relative = relative_directory.join(&name);
         let path = relative.to_string_lossy().replace('\\', "/");
-        let is_directory = file_type.is_dir();
         entries.push(RepositoryEntry {
             path,
             name,
@@ -513,6 +588,8 @@ fn collect_repository_entries(
                 depth.saturating_add(1),
                 entries,
                 truncated,
+                visible_files,
+                visible_directories,
             )?;
             if *truncated {
                 return Ok(());
@@ -534,9 +611,22 @@ fn canonical_repository_root(root: &Path) -> Result<PathBuf, String> {
 
 fn list_repository_path(root: &Path) -> Result<RepositoryView, String> {
     let root = canonical_repository_root(root)?;
+    let visible_paths = git_visible_repository_paths(&root)?;
+    let (visible_files, visible_directories) = visible_paths
+        .as_ref()
+        .map(|(files, directories)| (Some(files), Some(directories)))
+        .unwrap_or((None, None));
     let mut entries = Vec::new();
     let mut truncated = false;
-    collect_repository_entries(&root, Path::new(""), 0, &mut entries, &mut truncated)?;
+    collect_repository_entries(
+        &root,
+        Path::new(""),
+        0,
+        &mut entries,
+        &mut truncated,
+        visible_files,
+        visible_directories,
+    )?;
     Ok(RepositoryView { entries, truncated })
 }
 
@@ -3350,10 +3440,12 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
     }
 
     #[test]
-    fn lists_repository_sources_and_documentation_without_generated_directories() {
+    fn honors_gitignore_while_listing_source_and_extensionless_files() {
         let repository = std::env::temp_dir().join(format!("agent-grid-repository-{}", short_id()));
         fs::create_dir_all(repository.join("src")).unwrap();
         fs::create_dir_all(repository.join("node_modules/package")).unwrap();
+        fs::create_dir_all(repository.join(".venv/bin")).unwrap();
+        fs::write(repository.join(".gitignore"), "node_modules/\n.venv/\n").unwrap();
         fs::write(repository.join("README.md"), "# Test\n").unwrap();
         fs::write(repository.join("src/lib.rs"), "pub fn ready() {}\n").unwrap();
         fs::write(repository.join("Dockerfile"), "FROM scratch\n").unwrap();
@@ -3362,6 +3454,8 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             "generated\n",
         )
         .unwrap();
+        fs::write(repository.join(".venv/bin/python"), "ignored\n").unwrap();
+        git_checked(&repository, &["init", "-q"]).unwrap();
 
         let listing = list_repository_path(&repository).unwrap();
         assert!(!listing.truncated);
@@ -3381,6 +3475,14 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             .entries
             .iter()
             .any(|entry| entry.path.starts_with("node_modules")));
+        assert!(!listing
+            .entries
+            .iter()
+            .any(|entry| entry.path.starts_with(".venv")));
+        assert!(listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == ".gitignore" && !entry.is_directory));
 
         let file = read_repository_path(&repository, "README.md").unwrap();
         assert_eq!(file.content, "# Test\n");
