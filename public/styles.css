@@ -286,7 +286,7 @@ button { color: inherit; }
 .sidebar-add:hover { background: #1c2028; color: var(--text); }
 
 .project-list, .agent-list { min-height: 0; overflow: auto; padding: 3px 7px 8px; }
-.project-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 28px 25px; align-items: center; border-radius: 7px; }
+.project-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 25px; align-items: center; border-radius: 7px; }
 .project-row:hover, .project-row.active { background: #151820; }
 .project-row.active { box-shadow: inset 2px 0 var(--accent); }
 .project-row[draggable="true"] { cursor: grab; }
@@ -366,11 +366,7 @@ button { color: inherit; }
   background: #59616a;
 }
 .project-count { margin-top: 2px; color: var(--muted); font-size: 10px; }
-.project-editor,
-.project-delete { min-width: 24px; width: 24px; height: 24px; padding: 0; opacity: 0.5; font: 10px var(--mono); }
-.project-delete { opacity: 0; font-size: 14px; }
-.project-row:hover .project-editor,
-.project-row.active .project-editor,
+.project-delete { min-width: 24px; width: 24px; height: 24px; padding: 0; opacity: 0; font-size: 14px; }
 .project-row:hover .project-delete { opacity: 1; }
 
 .agent-list-item {

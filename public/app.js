@@ -533,7 +533,6 @@ function renderProjects() {
           <span class="project-count">${project.windows.length} window${project.windows.length === 1 ? "" : "s"}</span>
         </span>
       </button>
-      <button class="project-editor icon-button" data-open-project-editor="${project.id}" aria-label="Open ${escapeHtml(project.name)} in preferred editor" title="Open in preferred editor">&lt;/&gt;</button>
       <button class="project-delete icon-button" data-delete-project="${project.id}" title="Delete project">×</button>
     </div>`;
   }).join("");
@@ -2052,8 +2051,6 @@ windowForm.addEventListener("submit", async (event) => {
 
 projectList.addEventListener("click", async (event) => {
   const deleteId = event.target.closest("[data-delete-project]")?.dataset.deleteProject;
-  const editorId = event.target.closest("[data-open-project-editor]")?.dataset.openProjectEditor;
-  if (editorId) return openProjectInEditor(editorId);
   if (deleteId) return deleteProject(deleteId);
   const id = event.target.closest("[data-project-id]")?.dataset.projectId;
   if (!id || id === activeProjectId) return;
