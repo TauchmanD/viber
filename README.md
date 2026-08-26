@@ -195,6 +195,28 @@ Add that export to your shell profile if necessary, then launch:
 tmux-agent-grid
 ```
 
+### Updating an existing checkout
+
+The repository includes an executable updater for source installations:
+
+```bash
+./update.sh
+```
+
+The updater verifies required commands, requires a clean checkout on `main`, pulls `origin/main` with `--ff-only`, runs `npm ci`, then runs:
+
+```bash
+npm run build -- --no-bundle
+```
+
+The resulting release is installed to `~/.local/bin/tmux-agent-grid` by the normal post-build installer. The updater never resets, deletes, or automatically stashes local work; commit or stash local changes before using it.
+
+Show the updater's requirements without changing anything:
+
+```bash
+./update.sh --help
+```
+
 ### Optional desktop launcher
 
 After the release build, install the launcher and icon for the current user:
