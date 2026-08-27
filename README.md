@@ -288,6 +288,27 @@ The current backend launches tmux directly and uses Linux-specific process and s
 
 To run under Windows, install the Linux requirements inside WSL2, enable WSLg, keep the repository in the WSL filesystem, and run `npm run dev` or the Linux release build there. Native Windows support would require replacing tmux with a Windows session host such as a ConPTY-based service.
 
+### Troubleshooting: window never appears under WSLg
+
+WSL2's GPU passthrough (`dxgkrnl`) occasionally gets stuck in a broken state — after the host sleeps, after a Windows or WSL update, or simply after a long uptime. When that happens, launching the app prints warnings like:
+
+```text
+libEGL warning: failed to get driver name for fd -1
+libEGL warning: MESA-LOADER: failed to retrieve device information
+MESA: error: ZINK: failed to choose pdev
+libEGL warning: egl: failed to create dri2 screen
+```
+
+and the process either hangs indefinitely or opens a window that never becomes visible on the Windows desktop. This is a WSL/Windows-host issue, not specific to this app — WSLg's own compositor logs the same fallback (`Xwayland glamor: ... falling back to sw`) when the GPU channel is broken, and `dmesg | grep dxg` shows `dxgkio_query_adapter_info: Ioctl failed: -22`. The app detects a missing `/dev/dri` and falls back to software rendering automatically so the process no longer hangs, but that alone does not fix a WSLg session that has already lost its GPU channel.
+
+The reliable fix is to restart the WSL VM, from PowerShell or cmd on the Windows side (not from inside WSL):
+
+```powershell
+wsl --shutdown
+```
+
+then reopen your WSL terminal. If the warnings persist, run `wsl --update` and make sure your GPU driver is current.
+
 ## Project structure
 
 ```text

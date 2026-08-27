@@ -2883,7 +2883,47 @@ fn detach_terminal(id: String, state: State<'_, RuntimeState>) {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Environment variables that force WebKitGTK/Mesa onto the CPU software
+/// rasterizer instead of hardware-accelerated EGL/Zink, applied only when no
+/// DRI render node is present (already-set values are left untouched).
+const SOFTWARE_RENDERING_ENV_VARS: [(&str, &str); 3] = [
+    ("LIBGL_ALWAYS_SOFTWARE", "1"),
+    ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
+    ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+];
+
+/// Some virtualized Linux desktops (notably WSLg with a broken dxgkrnl GPU
+/// passthrough) expose no DRI render node at all. In that case WebKitGTK's
+/// hardware-accelerated Zink/EGL path doesn't fail cleanly — it hangs during
+/// webview creation and the window never appears. Detect the missing device
+/// up front and force software rendering so the app still starts.
+fn dri_render_node_present_at(dri_dir: &std::path::Path) -> bool {
+    dri_dir
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+fn dri_render_node_present() -> bool {
+    dri_render_node_present_at(std::path::Path::new("/dev/dri"))
+}
+
+fn configure_software_rendering_if_needed() {
+    if dri_render_node_present() {
+        return;
+    }
+    for (key, value) in SOFTWARE_RENDERING_ENV_VARS {
+        if std::env::var_os(key).is_none() {
+            // SAFETY: called at startup before any other thread exists.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+}
+
 pub fn run() {
+    configure_software_rendering_if_needed();
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -2964,6 +3004,41 @@ mod tests {
         fn drop(&mut self) {
             kill_session(&self.0);
         }
+    }
+
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_temp_dir(name: &str) -> TempDirGuard {
+        let dir = std::env::temp_dir().join(format!("tmux-agent-grid-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        TempDirGuard(dir)
+    }
+
+    #[test]
+    fn dri_render_node_present_is_false_for_missing_directory() {
+        let missing = std::env::temp_dir().join("tmux-agent-grid-test-missing-dri-dir");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(!dri_render_node_present_at(&missing));
+    }
+
+    #[test]
+    fn dri_render_node_present_is_false_for_empty_directory() {
+        let guard = make_temp_dir("empty-dri-dir");
+        assert!(!dri_render_node_present_at(&guard.0));
+    }
+
+    #[test]
+    fn dri_render_node_present_is_true_when_a_device_entry_exists() {
+        let guard = make_temp_dir("populated-dri-dir");
+        std::fs::write(guard.0.join("renderD128"), b"").unwrap();
+        assert!(dri_render_node_present_at(&guard.0));
     }
 
     #[test]
