@@ -69,9 +69,18 @@
           <section id="git-section" class="git-section" aria-label="Git controls">
             <div class="git-controls">
               <span class="git-branch-icon" aria-hidden="true">⑂</span>
-              <select id="git-branch-select" aria-label="Current Git branch" disabled>
-                <option>No project</option>
-              </select>
+              <button
+                type="button"
+                id="git-branch-select"
+                class="branch-select"
+                aria-label="Current Git branch"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                disabled
+              >
+                <span id="git-branch-select-label" class="branch-select-label">No project</span>
+                <span class="branch-select-caret" aria-hidden="true">▾</span>
+              </button>
               <button id="git-refresh-button" class="icon-button git-action" aria-label="Refresh Git status" title="Refresh Git status" disabled>↻</button>
               <button id="git-pull-button" class="icon-button git-action" aria-label="Pull current branch" title="Pull current branch" disabled>↓</button>
               <button id="git-push-button" class="icon-button git-action" aria-label="Push current branch" title="Push current branch" disabled>↑</button>
@@ -467,6 +476,8 @@
       <button type="button" role="menuitem" data-context-action="browse-repository">Browse repository</button>
       <button type="button" role="menuitem" data-context-action="open-editor">Open in preferred editor</button>
     </div>
+
+    <div id="git-branch-menu" class="context-menu branch-menu" role="listbox" aria-label="Local branches" hidden></div>
 
     <div id="toast" class="toast" role="status"></div>
     <script src="./vendor/xterm.js"></script>

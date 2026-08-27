@@ -17,6 +17,8 @@ const windowList = document.querySelector("#window-list");
 const windowCount = document.querySelector("#window-count");
 const gitSection = document.querySelector("#git-section");
 const gitBranchSelect = document.querySelector("#git-branch-select");
+const gitBranchSelectLabel = document.querySelector("#git-branch-select-label");
+const gitBranchMenu = document.querySelector("#git-branch-menu");
 const gitSummary = document.querySelector("#git-summary");
 const gitRefreshButton = document.querySelector("#git-refresh-button");
 const gitPullButton = document.querySelector("#git-pull-button");
@@ -105,6 +107,7 @@ let gitStatusProjectId = null;
 let gitStatusError = null;
 let gitStatusTimer;
 let gitOperationInFlight = false;
+let gitBranchOptions = [];
 let selectedWindowId = null;
 let timelineFilter = "all";
 let timelineEvents = [];
@@ -2012,7 +2015,7 @@ function renderGitStatus() {
   gitRefreshButton.disabled = !project || gitOperationInFlight;
 
   if (!project) {
-    gitBranchSelect.innerHTML = "<option>No project</option>";
+    setGitBranchOptions([], "No project");
     gitBranchSelect.disabled = true;
     gitPullButton.disabled = true;
     gitPushButton.disabled = true;
@@ -2020,7 +2023,7 @@ function renderGitStatus() {
     return;
   }
   if (loading) {
-    gitBranchSelect.innerHTML = "<option>Loading…</option>";
+    setGitBranchOptions([], "Loading…");
     gitBranchSelect.disabled = true;
     gitPullButton.disabled = true;
     gitPushButton.disabled = true;
@@ -2028,7 +2031,7 @@ function renderGitStatus() {
     return;
   }
   if (!status?.available) {
-    gitBranchSelect.innerHTML = `<option>${escapeHtml(status?.head || "Git unavailable")}</option>`;
+    setGitBranchOptions([], status?.head || "Git unavailable");
     gitBranchSelect.disabled = true;
     gitPullButton.disabled = true;
     gitPushButton.disabled = true;
@@ -2036,10 +2039,13 @@ function renderGitStatus() {
     return;
   }
 
-  const detached = status.branch ? "" : `<option value="" selected disabled>${escapeHtml(status.head)}</option>`;
-  gitBranchSelect.innerHTML = detached + status.branches.map((branch) =>
-    `<option value="${escapeHtml(branch)}" ${branch === status.branch ? "selected" : ""}>${escapeHtml(branch)}</option>`
-  ).join("");
+  const detached = status.branch ? [] : [{ value: "", label: status.head, selected: true, disabled: true }];
+  const options = detached.concat(status.branches.map((branch) => ({
+    value: branch,
+    label: branch,
+    selected: branch === status.branch,
+  })));
+  setGitBranchOptions(options, status.branch || status.head);
   gitBranchSelect.disabled = gitOperationInFlight || !status.branches.length;
   gitPullButton.disabled = gitOperationInFlight || !status.hasUpstream;
   gitPushButton.disabled = gitOperationInFlight || !status.branch;
@@ -2053,6 +2059,68 @@ function renderGitStatus() {
     status.upstream ? escapeHtml(status.upstream) : "No upstream",
   ].filter(Boolean);
   gitSummary.innerHTML = summary.join(" · ");
+}
+
+// The branch picker is a custom listbox, not a native <select>, so we can
+// position its popup ourselves (flipping it above the trigger when there's
+// no room below) instead of leaving that to the OS toolkit. WSLg's Wayland
+// compositor doesn't implement popup constraint solving, so native GTK/
+// WebKitGTK popups near the bottom of the window always open downward and
+// get clipped — this sidesteps that by never delegating positioning to it.
+function setGitBranchOptions(options, labelText) {
+  gitBranchOptions = options;
+  gitBranchSelectLabel.textContent = labelText;
+  renderGitBranchMenu();
+  if (!gitBranchMenu.hidden) positionGitBranchMenu();
+}
+
+function renderGitBranchMenu() {
+  gitBranchMenu.innerHTML = gitBranchOptions.map((option) => `
+    <button
+      type="button"
+      role="option"
+      class="branch-menu-item${option.selected ? " selected" : ""}"
+      aria-selected="${option.selected ? "true" : "false"}"
+      data-branch="${escapeHtml(option.value)}"
+      ${option.disabled ? "disabled" : ""}
+    >${escapeHtml(option.label)}</button>
+  `).join("");
+}
+
+function positionGitBranchMenu() {
+  const triggerRect = gitBranchSelect.getBoundingClientRect();
+  const margin = 6;
+  const preferredWidth = Math.max(triggerRect.width, 260);
+  gitBranchMenu.style.minWidth = `${triggerRect.width}px`;
+  gitBranchMenu.style.maxWidth = `${Math.min(preferredWidth, window.innerWidth - margin * 2)}px`;
+  gitBranchMenu.style.left = `${Math.max(margin, Math.min(triggerRect.left, window.innerWidth - gitBranchMenu.offsetWidth - margin))}px`;
+
+  const spaceBelow = window.innerHeight - triggerRect.bottom - margin;
+  const spaceAbove = triggerRect.top - margin;
+  const openUpward = gitBranchMenu.scrollHeight > spaceBelow && spaceAbove > spaceBelow;
+  if (openUpward) {
+    gitBranchMenu.style.top = "";
+    gitBranchMenu.style.bottom = `${window.innerHeight - triggerRect.top + 4}px`;
+    gitBranchMenu.style.maxHeight = `${Math.max(120, spaceAbove)}px`;
+  } else {
+    gitBranchMenu.style.bottom = "";
+    gitBranchMenu.style.top = `${triggerRect.bottom + 4}px`;
+    gitBranchMenu.style.maxHeight = `${Math.max(120, spaceBelow)}px`;
+  }
+}
+
+function openGitBranchMenu() {
+  if (gitBranchSelect.disabled || !gitBranchOptions.length) return;
+  gitBranchMenu.hidden = false;
+  gitBranchSelect.setAttribute("aria-expanded", "true");
+  positionGitBranchMenu();
+  (gitBranchMenu.querySelector(".selected") || gitBranchMenu.querySelector("button:not(:disabled)"))?.focus();
+}
+
+function closeGitBranchMenu() {
+  if (gitBranchMenu.hidden) return;
+  gitBranchMenu.hidden = true;
+  gitBranchSelect.setAttribute("aria-expanded", "false");
 }
 
 async function refreshGitStatus({ quiet = true } = {}) {
@@ -2657,15 +2725,21 @@ preferredEditorCustom.addEventListener("input", () => {
   updateEditorControls();
 });
 gitRefreshButton.addEventListener("click", () => refreshGitStatus({ quiet: false }));
-gitBranchSelect.addEventListener("change", () => {
-  if (gitBranchSelect.value && gitBranchSelect.value !== gitStatus?.branch) {
-    runGitOperation(
-      "switch_git_branch",
-      { branch: gitBranchSelect.value },
-      `Switched to ${gitBranchSelect.value}.`,
-    );
+gitBranchSelect.addEventListener("click", () => {
+  if (gitBranchMenu.hidden) openGitBranchMenu();
+  else closeGitBranchMenu();
+});
+gitBranchMenu.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-branch]");
+  if (!button || button.disabled) return;
+  const branch = button.dataset.branch;
+  closeGitBranchMenu();
+  gitBranchSelect.focus();
+  if (branch && branch !== gitStatus?.branch) {
+    runGitOperation("switch_git_branch", { branch }, `Switched to ${branch}.`);
   }
 });
+window.addEventListener("resize", closeGitBranchMenu);
 gitPullButton.addEventListener("click", () => runGitOperation("pull_git", {}, "Pull completed."));
 gitPushButton.addEventListener("click", () => runGitOperation("push_git", {}, "Push completed."));
 document.querySelector("#compact-menu-button").addEventListener("click", openCompactMenu);
@@ -2878,10 +2952,14 @@ document.addEventListener("pointerdown", (event) => {
   if (!projectContextMenu.hidden && !event.target.closest("#project-context-menu")) {
     closeProjectContextMenu();
   }
+  if (!gitBranchMenu.hidden && !event.target.closest("#git-branch-menu") && !event.target.closest("#git-branch-select")) {
+    closeGitBranchMenu();
+  }
 });
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !projectContextMenu.hidden) closeProjectContextMenu();
+  if (event.key === "Escape" && !gitBranchMenu.hidden) closeGitBranchMenu();
 });
 
 projectList.addEventListener("dragstart", (event) => {
