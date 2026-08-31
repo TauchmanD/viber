@@ -391,6 +391,24 @@
       </form>
     </dialog>
 
+    <dialog id="remote-directory-dialog" class="modal remote-directory-modal">
+      <form method="dialog">
+        <div class="modal-header">
+          <div><p class="eyebrow">Remote filesystem</p><h2>Choose a directory</h2></div>
+          <button type="button" class="icon-button dialog-close" aria-label="Close">×</button>
+        </div>
+        <div class="remote-directory-toolbar">
+          <button id="remote-directory-up" type="button" class="icon-button" aria-label="Parent directory" title="Parent directory">↑</button>
+          <code id="remote-directory-path">Loading…</code>
+        </div>
+        <div id="remote-directory-list" class="remote-directory-list" role="listbox" aria-label="Remote directories"></div>
+        <div class="modal-actions">
+          <button type="button" class="button ghost dialog-close">Cancel</button>
+          <button type="button" id="select-remote-directory" class="button primary">Select this directory</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog id="settings-dialog" class="modal settings-modal">
       <form method="dialog">
         <div class="modal-header">

@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 - Configurable arrow-key navigation for spatial terminal focus and previous/next project switching, with persistent bindings, conflict detection, and reset controls in Settings.
 - Escape-key navigation from Apps, Tunnels, Repository, and Activity views back to the terminal grid.
 - Full remote workspaces through persisted OpenSSH Host profiles, including remote tmux terminals, Git operations, repository browsing, Docker and process discovery, automatic loopback port forwarding, connection tests, and VS Code/Cursor remote launch.
+- Remote directory browser for project and window working directories, with parent navigation and selection inside the project dialog.
 
 ### Fixed
 
@@ -20,6 +21,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 - OMP and Chromium helper listeners no longer appear as user applications or opening URLs.
 - Newly created agent and terminal windows receive keyboard focus immediately.
 - Project switches focus the first available terminal, and hovering a terminal window moves keyboard focus to it.
+- SSH connection test results render inline in Settings instead of behind a modal backdrop.
 
 ## [0.2.0] - 2026-08-26
 

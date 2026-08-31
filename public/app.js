@@ -59,6 +59,8 @@ const runningAppsButton = document.querySelector("#running-apps-button");
 const sshProfileDialog = document.querySelector("#ssh-profile-dialog");
 const sshProfileForm = document.querySelector("#ssh-profile-form");
 const sshProfileList = document.querySelector("#ssh-profile-list");
+const remoteDirectoryDialog = document.querySelector("#remote-directory-dialog");
+const remoteDirectoryList = document.querySelector("#remote-directory-list");
 const terminals = new Map();
 const sidebarWidthKey = "agent-grid-sidebar-width";
 const projectSectionShareKey = "agent-grid-projects-share";
@@ -127,6 +129,10 @@ let runningAppsRequestInFlight = false;
 const appOpeningDrafts = new Map();
 let sshProfiles = [];
 let editingSshProfileId = null;
+const sshProfileTestStates = new Map();
+let remoteDirectoryProfileId = null;
+let remoteDirectoryTargetInput = null;
+let remoteDirectoryView = null;
 let shortcutBindings = loadShortcutBindings();
 let recordingShortcut = null;
 let projectSwitchInFlight = false;
@@ -2130,7 +2136,9 @@ function renderProjectSshOptions(selected = "") {
 function updateProjectLocationControls() {
   const profileId = document.querySelector("#project-ssh-profile").value;
   const remote = Boolean(profileId);
-  document.querySelector('[data-browse="project-cwd"]').hidden = remote;
+  const browse = document.querySelector('[data-browse="project-cwd"]');
+  browse.hidden = false;
+  browse.textContent = remote ? "Browse remote…" : "Browse…";
   document.querySelector("#project-location-help").textContent = remote
     ? "tmux, commands, Git, files, Docker, and ports use the selected SSH host."
     : "Commands, tmux, Git, and files use this machine.";
@@ -2140,15 +2148,28 @@ function updateProjectLocationControls() {
 }
 
 function renderSshProfiles() {
-  sshProfileList.innerHTML = sshProfiles.length ? sshProfiles.map((profile) => `
-    <div class="ssh-profile-row" data-ssh-profile="${escapeHtml(profile.id)}">
+  sshProfileList.innerHTML = sshProfiles.length ? sshProfiles.map((profile) => {
+    const status = sshProfileTestStates.get(profile.id);
+    const statusCopy = status?.state === "testing"
+      ? "Testing connection…"
+      : status?.state === "connected"
+        ? "Connected"
+        : status?.state === "error"
+          ? `Failed · ${status.message}`
+          : "";
+    return `
+    <div class="ssh-profile-row ${status?.state || ""}" data-ssh-profile="${escapeHtml(profile.id)}">
       <span class="ssh-profile-mark" aria-hidden="true">⌁</span>
-      <span><strong>${escapeHtml(profile.name)}</strong><small>Host ${escapeHtml(profile.host)}</small></span>
-      <button type="button" class="button ghost" data-ssh-profile-action="test">Test</button>
+      <span>
+        <strong>${escapeHtml(profile.name)}</strong>
+        <small>Host ${escapeHtml(profile.host)}</small>
+        ${statusCopy ? `<small class="ssh-profile-test-status ${escapeHtml(status.state)}" title="${escapeHtml(status.message || statusCopy)}">${escapeHtml(statusCopy)}</small>` : ""}
+      </span>
+      <button type="button" class="button ghost" data-ssh-profile-action="test" ${status?.state === "testing" ? "disabled" : ""}>Test</button>
       <button type="button" class="button ghost" data-ssh-profile-action="edit">Edit</button>
       <button type="button" class="icon-button danger-button" data-ssh-profile-action="delete" title="Delete SSH connection">×</button>
-    </div>
-  `).join("") : `<p class="ssh-profile-empty">No SSH connections configured.</p>`;
+    </div>`;
+  }).join("") : `<p class="ssh-profile-empty">No SSH connections configured.</p>`;
 }
 
 async function refreshSshProfiles() {
@@ -2168,12 +2189,15 @@ function openSshProfileModal(profile = null) {
 }
 
 async function testSshProfile(id) {
+  sshProfileTestStates.set(id, { state: "testing", message: "" });
+  renderSshProfiles();
   try {
     await call("test_ssh_profile", { id });
-    showToast("SSH connection succeeded.");
+    sshProfileTestStates.set(id, { state: "connected", message: "SSH connection succeeded." });
   } catch (error) {
-    showToast(`SSH connection failed: ${error.message}`, true);
+    sshProfileTestStates.set(id, { state: "error", message: error.message });
   }
+  renderSshProfiles();
 }
 
 async function deleteSshProfile(id) {
@@ -2186,6 +2210,52 @@ async function deleteSshProfile(id) {
   } catch (error) {
     showToast(error.message, true);
   }
+}
+
+function remoteProfileForInput(inputId) {
+  const profileId = inputId === "project-cwd"
+    ? document.querySelector("#project-ssh-profile").value
+    : activeProject()?.sshProfileId;
+  return sshProfiles.find((profile) => profile.id === profileId) || null;
+}
+
+function renderRemoteDirectoryView() {
+  document.querySelector("#remote-directory-path").textContent = remoteDirectoryView?.path || "Loading…";
+  document.querySelector("#remote-directory-up").disabled = !remoteDirectoryView?.parent;
+  document.querySelector("#select-remote-directory").disabled = !remoteDirectoryView;
+  remoteDirectoryList.innerHTML = remoteDirectoryView
+    ? remoteDirectoryView.entries.map((entry) => `
+      <button type="button" class="remote-directory-entry" role="option" data-remote-directory="${escapeHtml(entry.path)}">
+        <span aria-hidden="true">⌄</span><strong>${escapeHtml(entry.name)}</strong>
+      </button>
+    `).join("") || `<p class="remote-directory-empty">No child directories.</p>`
+    : `<p class="remote-directory-empty">Reading remote directories…</p>`;
+}
+
+async function loadRemoteDirectory(path, allowHomeFallback = false) {
+  remoteDirectoryView = null;
+  renderRemoteDirectoryView();
+  try {
+    remoteDirectoryView = await call("list_remote_directories", {
+      profileId: remoteDirectoryProfileId,
+      path: path || null
+    });
+    renderRemoteDirectoryView();
+  } catch (error) {
+    if (allowHomeFallback && path) return loadRemoteDirectory(null, false);
+    remoteDirectoryList.innerHTML = `<p class="remote-directory-empty error">${escapeHtml(error.message)}</p>`;
+    document.querySelector("#remote-directory-path").textContent = "Remote directory unavailable";
+  }
+}
+
+async function openRemoteDirectoryBrowser(profile, inputId) {
+  remoteDirectoryProfileId = profile.id;
+  remoteDirectoryTargetInput = inputId;
+  remoteDirectoryView = null;
+  remoteDirectoryDialog.showModal();
+  renderRemoteDirectoryView();
+  const current = document.querySelector(`#${inputId}`).value.trim();
+  await loadRemoteDirectory(current.startsWith("/") ? current : null, true);
 }
 
 function openProjectModal() {
@@ -2238,13 +2308,17 @@ function openWindowModal() {
   if (!project) return openProjectModal();
   document.querySelector("#window-cwd").value = project.cwd;
   document.querySelector("#window-command").value = project.defaultCommand;
-  document.querySelector('[data-browse="window-cwd"]').hidden = project.remote;
+  const browse = document.querySelector('[data-browse="window-cwd"]');
+  browse.hidden = false;
+  browse.textContent = project.remote ? "Browse remote…" : "Browse…";
   windowDialog.showModal();
   setWindowKind("agent");
   document.querySelector("#window-name").select();
 }
 
 async function browseDirectory(inputId) {
+  const profile = remoteProfileForInput(inputId);
+  if (profile) return openRemoteDirectoryBrowser(profile, inputId);
   const input = document.querySelector(`#${inputId}`);
   try {
     const selected = await openDialog({ directory: true, multiple: false, defaultPath: input.value || config.defaultCwd, title: "Choose a working directory" });
@@ -2614,6 +2688,23 @@ compactWindowList.addEventListener("click", (event) => {
 });
 document.querySelectorAll(".dialog-close").forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
 document.querySelectorAll(".browse-button").forEach((button) => button.addEventListener("click", () => browseDirectory(button.dataset.browse)));
+remoteDirectoryList.addEventListener("click", (event) => {
+  const path = event.target.closest("[data-remote-directory]")?.dataset.remoteDirectory;
+  if (path) loadRemoteDirectory(path);
+});
+document.querySelector("#remote-directory-up").addEventListener("click", () => {
+  if (remoteDirectoryView?.parent) loadRemoteDirectory(remoteDirectoryView.parent);
+});
+document.querySelector("#select-remote-directory").addEventListener("click", () => {
+  if (!remoteDirectoryView || !remoteDirectoryTargetInput) return;
+  document.querySelector(`#${remoteDirectoryTargetInput}`).value = remoteDirectoryView.path;
+  remoteDirectoryDialog.close();
+});
+remoteDirectoryDialog.addEventListener("close", () => {
+  remoteDirectoryProfileId = null;
+  remoteDirectoryTargetInput = null;
+  remoteDirectoryView = null;
+});
 document.querySelectorAll(".kind-option").forEach((button) => button.addEventListener("click", () => setWindowKind(button.dataset.kind)));
 document.querySelector("#activity-filters").addEventListener("click", (event) => {
   const button = event.target.closest("[data-timeline-filter]");

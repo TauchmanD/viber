@@ -466,6 +466,21 @@ struct RepositoryView {
     truncated: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteDirectoryEntry {
+    name: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteDirectoryView {
+    path: String,
+    parent: Option<String>,
+    entries: Vec<RemoteDirectoryEntry>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RepositoryFileView {
@@ -2722,6 +2737,88 @@ fn test_ssh_profile(id: String, state: State<'_, RuntimeState>) -> Result<String
     target_checked(&target, "sh", &["-lc", "printf 'connected'"])
 }
 
+fn list_directories_on(
+    target: &ExecutionTarget,
+    requested_path: Option<&str>,
+) -> Result<RemoteDirectoryView, String> {
+    let requested = match requested_path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => {
+            if !path.starts_with('/') || path.chars().any(char::is_control) {
+                return Err("Remote directory path must be absolute.".into());
+            }
+            path.to_owned()
+        }
+        None => target_checked(target, "sh", &["-lc", "printf '%s' \"$HOME\""])?,
+    };
+    let path = target_checked(target, "realpath", &["-e", &requested])?;
+    if !target_success(target, "test", &["-d", &path]) {
+        return Err(format!("Remote directory does not exist: {requested}"));
+    }
+    let output = target_output(
+        target,
+        "find",
+        &[
+            &path,
+            "-mindepth",
+            "1",
+            "-maxdepth",
+            "1",
+            "-type",
+            "d",
+            "-print0",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let mut entries = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| String::from_utf8(value.to_vec()).ok())
+        .filter_map(|entry_path| {
+            let name = Path::new(&entry_path)
+                .file_name()?
+                .to_str()?
+                .to_owned();
+            if name == ".git" {
+                return None;
+            }
+            Some(RemoteDirectoryEntry {
+                name,
+                path: entry_path,
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
+    let parent = Path::new(&path)
+        .parent()
+        .filter(|parent| parent != &Path::new(&path))
+        .map(|parent| parent.to_string_lossy().into_owned());
+    Ok(RemoteDirectoryView {
+        path,
+        parent,
+        entries,
+    })
+}
+
+#[tauri::command]
+fn list_remote_directories(
+    profile_id: String,
+    path: Option<String>,
+    state: State<'_, RuntimeState>,
+) -> Result<RemoteDirectoryView, String> {
+    let target = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        execution_target(&store.data, Some(&profile_id))?
+    };
+    list_directories_on(&target, path.as_deref())
+}
+
 fn validate_ssh_host(value: &str, label: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -4666,6 +4763,7 @@ pub fn run() {
             update_ssh_profile,
             delete_ssh_profile,
             test_ssh_profile,
+            list_remote_directories,
             get_ssh_tunnels,
             create_ssh_tunnel,
             update_ssh_tunnel,
@@ -5424,9 +5522,23 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
 
         let id = short_id();
         let root = format!("/tmp/agent-grid-remote-{id}");
-        target_checked(&target, "mkdir", &["-p", &root]).unwrap();
+        target_checked(
+            &target,
+            "mkdir",
+            &["-p", &root, &format!("{root}/nested")],
+        )
+        .unwrap();
         write_remote_text(&target, &format!("{root}/README.md"), "# Remote\n").unwrap();
         target_checked(&target, "git", &["-C", &root, "init", "-q"]).unwrap();
+        let directories = list_directories_on(&target, Some(&root)).unwrap();
+        assert_eq!(directories.path, root);
+        assert_eq!(
+            directories.entries,
+            [RemoteDirectoryEntry {
+                name: "nested".into(),
+                path: format!("{root}/nested"),
+            }]
+        );
         let repository = list_repository_on(&target, &root).unwrap();
         assert!(repository
             .entries

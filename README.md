@@ -176,7 +176,7 @@ Remote workspaces use the system OpenSSH client and existing `Host` entries from
 
 2. Open **Settings → SSH connections**, add `development` as the Host alias, and use **Test**.
 3. Create a project and choose that connection under **Runs on**.
-4. Enter an absolute directory from the remote host, for example `/home/developer/projects/api`.
+4. Browse the remote filesystem or enter an absolute directory such as `/home/developer/projects/api`.
 
 The remote host requires `tmux` and Git. OMP and other agent commands must also be installed remotely when used by the project. Docker is optional.
 
