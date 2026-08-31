@@ -8,6 +8,7 @@ const {
   clampProjectHeight,
   projectHeightFromShare,
   projectShareFromHeight,
+  directionalNeighbor,
 } = globalThis.UiLayout;
 
 test("sidebar width stays within usable desktop bounds", () => {
@@ -34,4 +35,19 @@ test("project section share survives viewport height changes", () => {
   assert.equal(projectHeightFromShare(share, 900), 558);
   assert.equal(projectHeightFromShare(share, 700), 434);
   assert.equal(projectHeightFromShare(null, 700), 434);
+});
+
+test("directional window navigation follows tile geometry", () => {
+  const tiles = [
+    { id: "top-left", left: 0, top: 0, width: 100, height: 100 },
+    { id: "top-right", left: 110, top: 0, width: 100, height: 100 },
+    { id: "bottom-left", left: 0, top: 110, width: 100, height: 100 },
+    { id: "bottom-right", left: 110, top: 110, width: 100, height: 100 },
+  ];
+  assert.equal(directionalNeighbor(tiles, "top-left", "right"), "top-right");
+  assert.equal(directionalNeighbor(tiles, "top-left", "down"), "bottom-left");
+  assert.equal(directionalNeighbor(tiles, "bottom-right", "left"), "bottom-left");
+  assert.equal(directionalNeighbor(tiles, "bottom-right", "up"), "top-right");
+  assert.equal(directionalNeighbor(tiles, "top-left", "left"), null);
+  assert.equal(directionalNeighbor(tiles, "missing", "right"), null);
 });

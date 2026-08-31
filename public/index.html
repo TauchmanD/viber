@@ -20,6 +20,16 @@
           <button id="compact-mode-button" class="icon-button topbar-icon" aria-label="Enter compact view" aria-pressed="false" title="Compact view">▯</button>
           <button id="settings-button" class="icon-button topbar-icon" aria-label="Open settings" title="Settings">⚙</button>
           <button id="repository-button" class="icon-button topbar-icon" aria-label="Browse repository" aria-pressed="false" title="Browse repository" disabled>&lt;/&gt;</button>
+          <button id="running-apps-button" class="topbar-tab running-apps-tab" type="button" aria-label="Show running applications" aria-pressed="false" title="Running applications">
+            <span class="topbar-tab-icon" aria-hidden="true">◫</span>
+            <span>Apps</span>
+            <span id="running-apps-count" class="topbar-tab-count">0</span>
+          </button>
+          <button id="ssh-tunnels-button" class="topbar-tab" type="button" aria-label="Manage SSH tunnels" aria-pressed="false" title="SSH tunnels">
+            <span class="topbar-tab-icon" aria-hidden="true">⇄</span>
+            <span>Tunnels</span>
+            <span id="ssh-tunnels-count" class="topbar-tab-count">0</span>
+          </button>
           <div class="grid-controls" aria-label="Tiling layout">
             <button id="auto-grid-button" class="grid-mode-button active" aria-label="Retile automatically" title="Retile automatically">⊞</button>
             <button id="fewer-columns-button" class="icon-button" title="Fewer columns">−</button>
@@ -145,6 +155,64 @@
             </article>
           </article>
         </section>
+        <section id="running-apps-view" class="running-apps-view" aria-label="Running applications" hidden>
+          <header class="running-apps-toolbar">
+            <div class="running-apps-heading">
+              <span class="running-apps-mark" aria-hidden="true">◫</span>
+              <div>
+                <p class="eyebrow">Runtime inventory</p>
+                <strong>Running applications</strong>
+              </div>
+            </div>
+            <div class="running-apps-actions">
+              <span id="running-apps-summary" class="running-apps-summary">Nothing detected</span>
+              <button id="running-apps-refresh-button" class="icon-button" type="button" aria-label="Refresh running applications" title="Refresh running applications">↻</button>
+              <button id="running-apps-close-button" class="icon-button" type="button" aria-label="Close running applications" title="Close running applications">×</button>
+            </div>
+          </header>
+          <div class="running-apps-content">
+            <div class="running-apps-intro">
+              <div>
+                <span id="running-apps-service-total">0</span>
+                <small>RUNNING SERVICES</small>
+              </div>
+              <p>Compose services stay together. Local listeners are grouped by Agent Grid project.</p>
+              <div>
+                <span id="running-apps-group-total">0</span>
+                <small>APPLICATION GROUPS</small>
+              </div>
+            </div>
+            <p id="running-apps-docker-warning" class="running-apps-warning" hidden></p>
+            <div id="running-apps-list" class="running-apps-list"></div>
+          </div>
+        </section>
+        <section id="ssh-tunnels-view" class="ssh-tunnels-view" aria-label="SSH tunnel management" hidden>
+          <header class="ssh-tunnels-toolbar">
+            <div class="ssh-tunnels-heading">
+              <span class="ssh-tunnels-mark" aria-hidden="true">⇄</span>
+              <div>
+                <p class="eyebrow">Secure forwarding</p>
+                <strong>SSH tunnels</strong>
+              </div>
+            </div>
+            <div class="ssh-tunnels-actions">
+              <span id="ssh-tunnels-summary" class="ssh-tunnels-summary">No tunnels defined</span>
+              <button id="new-ssh-tunnel-button" class="button primary" type="button">New tunnel</button>
+              <button id="ssh-tunnels-refresh-button" class="icon-button" type="button" aria-label="Refresh tunnel status" title="Refresh tunnel status">↻</button>
+              <button id="ssh-tunnels-close-button" class="icon-button" type="button" aria-label="Close SSH tunnels" title="Close SSH tunnels">×</button>
+            </div>
+          </header>
+          <div class="ssh-tunnels-content">
+            <div class="ssh-route-legend" aria-hidden="true">
+              <span><small>LOCAL</small>127.0.0.1</span>
+              <i></i>
+              <span><small>ENCRYPTED</small>SSH</span>
+              <i></i>
+              <span><small>TARGET</small>private service</span>
+            </div>
+            <div id="ssh-tunnels-list" class="ssh-tunnels-list"></div>
+          </div>
+        </section>
         <aside id="activity-panel" class="activity-panel" aria-label="Window activity" aria-hidden="true">
           <div class="activity-panel-header">
             <div>
@@ -241,6 +309,59 @@
       </form>
     </dialog>
 
+    <dialog id="ssh-tunnel-dialog" class="modal ssh-tunnel-modal">
+      <form id="ssh-tunnel-form" method="dialog">
+        <div class="modal-header">
+          <div><p id="ssh-tunnel-dialog-eyebrow" class="eyebrow">New route</p><h2 id="ssh-tunnel-dialog-title">Define SSH tunnel</h2></div>
+          <button type="button" class="icon-button dialog-close" aria-label="Close">×</button>
+        </div>
+        <label>
+          <span>Name</span>
+          <input id="ssh-tunnel-name" name="name" maxlength="60" placeholder="Production database" required autocomplete="off">
+        </label>
+        <div class="ssh-tunnel-form-grid ssh-server-fields">
+          <label>
+            <span>SSH host</span>
+            <input id="ssh-tunnel-host" name="sshHost" placeholder="bastion.example.com" required spellcheck="false">
+          </label>
+          <label>
+            <span>SSH port</span>
+            <input id="ssh-tunnel-ssh-port" name="sshPort" type="number" min="1" max="65535" value="22" required inputmode="numeric">
+          </label>
+        </div>
+        <div class="ssh-tunnel-form-grid">
+          <label>
+            <span>SSH username <small>optional</small></span>
+            <input id="ssh-tunnel-username" name="username" placeholder="deploy" autocomplete="username" spellcheck="false">
+          </label>
+          <label>
+            <span>Identity file <small>optional</small></span>
+            <input id="ssh-tunnel-identity" name="identityFile" placeholder="~/.ssh/id_ed25519" spellcheck="false">
+          </label>
+        </div>
+        <div class="ssh-tunnel-route-fields">
+          <label>
+            <span>Local port</span>
+            <input id="ssh-tunnel-local-port" name="localPort" type="number" min="1" max="65535" placeholder="5433" required inputmode="numeric">
+          </label>
+          <span class="ssh-route-arrow" aria-hidden="true">→</span>
+          <label>
+            <span>Remote host</span>
+            <input id="ssh-tunnel-remote-host" name="remoteHost" value="127.0.0.1" required spellcheck="false">
+          </label>
+          <label>
+            <span>Remote port</span>
+            <input id="ssh-tunnel-remote-port" name="remotePort" type="number" min="1" max="65535" placeholder="5432" required inputmode="numeric">
+          </label>
+        </div>
+        <small class="ssh-tunnel-note">The local listener binds to 127.0.0.1. Authentication uses your SSH agent, config, or the optional identity file.</small>
+        <div class="modal-actions">
+          <button type="button" class="button ghost dialog-close">Cancel</button>
+          <button type="submit" id="save-ssh-tunnel-button" class="button primary">Save tunnel</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog id="settings-dialog" class="modal settings-modal">
       <form method="dialog">
         <div class="modal-header">
@@ -265,6 +386,22 @@
           <input id="preferred-editor-custom" type="text" placeholder="/path/to/editor" spellcheck="false" hidden>
           <small>Projects open as folders. Custom values must be an executable name or absolute path, without arguments.</small>
         </label>
+        <section class="shortcut-settings" aria-labelledby="shortcut-settings-title">
+          <div class="shortcut-settings-heading">
+            <strong id="shortcut-settings-title">Keyboard navigation</strong>
+            <small>Click a shortcut, then press a modifier combination with any arrow key.</small>
+          </div>
+          <div class="shortcut-setting-row">
+            <span><strong>Focus windows</strong><small>Arrow direction chooses the neighboring terminal.</small></span>
+            <button type="button" class="shortcut-recorder" data-shortcut-record="windowFocus" aria-pressed="false">Alt + Arrow keys</button>
+            <button type="button" class="shortcut-reset" data-shortcut-reset="windowFocus" title="Reset window focus shortcut">↺</button>
+          </div>
+          <div class="shortcut-setting-row">
+            <span><strong>Switch projects</strong><small>Left/up selects previous; right/down selects next.</small></span>
+            <button type="button" class="shortcut-recorder" data-shortcut-record="projectSwitch" aria-pressed="false">Ctrl + Alt + Arrow keys</button>
+            <button type="button" class="shortcut-reset" data-shortcut-reset="projectSwitch" title="Reset project shortcut">↺</button>
+          </div>
+        </section>
         <div class="modal-actions">
           <button type="button" class="button primary dialog-close">Done</button>
         </div>

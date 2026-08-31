@@ -35,6 +35,30 @@
     return clampProjectHeight(available * finiteNumber(share, DEFAULT_PROJECT_SHARE), available);
   }
 
+  function directionalNeighbor(items, currentId, direction) {
+    const current = items.find((item) => item.id === currentId);
+    if (!current || !["left", "right", "up", "down"].includes(direction)) return null;
+    const currentX = current.left + current.width / 2;
+    const currentY = current.top + current.height / 2;
+    const horizontal = direction === "left" || direction === "right";
+    const sign = direction === "left" || direction === "up" ? -1 : 1;
+    let best = null;
+    for (const item of items) {
+      if (item.id === currentId) continue;
+      const deltaX = item.left + item.width / 2 - currentX;
+      const deltaY = item.top + item.height / 2 - currentY;
+      const primary = sign * (horizontal ? deltaX : deltaY);
+      if (primary <= 1) continue;
+      const perpendicular = Math.abs(horizontal ? deltaY : deltaX);
+      const score = primary + perpendicular * 2;
+      if (!best || score < best.score || (score === best.score && primary < best.primary)) {
+        best = { id: item.id, primary, score };
+      }
+    }
+    return best?.id || null;
+  }
+
+
   global.UiLayout = Object.freeze({
     DEFAULT_SIDEBAR_WIDTH,
     DEFAULT_PROJECT_SHARE,
@@ -42,5 +66,6 @@
     clampProjectHeight,
     projectHeightFromShare,
     projectShareFromHeight,
+    directionalNeighbor,
   });
 })(globalThis);

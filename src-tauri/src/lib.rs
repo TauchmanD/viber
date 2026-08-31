@@ -6,7 +6,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child as ProcessChild, Command, Stdio},
     sync::Mutex,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -89,6 +89,22 @@ struct Project {
     windows: Vec<StoredWindow>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshTunnel {
+    id: String,
+    name: String,
+    ssh_host: String,
+    ssh_port: u16,
+    username: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_file: Option<String>,
+    created_at: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoreData {
@@ -96,10 +112,14 @@ struct StoreData {
     version: u32,
     #[serde(default)]
     projects: Vec<Project>,
+    #[serde(default)]
+    ssh_tunnels: Vec<SshTunnel>,
+    #[serde(default)]
+    app_opening_urls: BTreeMap<String, String>,
 }
 
 fn store_version() -> u32 {
-    5
+    7
 }
 
 struct Store {
@@ -124,6 +144,8 @@ impl Store {
             StoreData {
                 version: store_version(),
                 projects: Vec::new(),
+                ssh_tunnels: Vec::new(),
+                app_opening_urls: BTreeMap::new(),
             }
         };
         data.version = store_version();
@@ -183,6 +205,8 @@ fn migrate_store(raw: &str) -> Result<StoreData, String> {
     Ok(StoreData {
         version: store_version(),
         projects,
+        ssh_tunnels: Vec::new(),
+        app_opening_urls: BTreeMap::new(),
     })
 }
 
@@ -199,6 +223,7 @@ struct RuntimeState {
     snapshots: Mutex<HashMap<String, RuntimeSnapshot>>,
     omp_states: Mutex<HashMap<PathBuf, (u64, Option<String>)>>,
     compact_window: Mutex<Option<(i32, i32, u32, u32)>>,
+    ssh_tunnel_processes: Mutex<HashMap<String, ProcessChild>>,
     app_data_dir: PathBuf,
 }
 
@@ -217,6 +242,19 @@ struct WindowInput {
     cwd: String,
     command: Option<String>,
     kind: WindowKind,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SshTunnelInput {
+    name: String,
+    ssh_host: String,
+    ssh_port: u16,
+    username: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+    identity_file: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -245,6 +283,59 @@ struct ProjectView {
     default_command: String,
     created_at: String,
     windows: Vec<WindowView>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshTunnelView {
+    id: String,
+    name: String,
+    ssh_host: String,
+    ssh_port: u16,
+    username: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+    identity_file: Option<String>,
+    created_at: String,
+    running: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunningAppPortView {
+    url: String,
+    label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunningAppServiceView {
+    id: String,
+    name: String,
+    image: Option<String>,
+    status: String,
+    ports: Vec<RunningAppPortView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunningAppGroupView {
+    id: String,
+    name: String,
+    kind: String,
+    source: String,
+    services: Vec<RunningAppServiceView>,
+    opening_url: Option<String>,
+    custom_opening_url: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunningAppsView {
+    groups: Vec<RunningAppGroupView>,
+    service_count: usize,
+    docker_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1949,6 +2040,646 @@ fn get_config() -> serde_json::Value {
     serde_json::json!({ "defaultCwd": default_cwd, "defaultCommand": "omp" })
 }
 
+fn validate_ssh_host(value: &str, label: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{label} is required."));
+    }
+    if value.len() > 255
+        || value.starts_with('-')
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control() || character == '@')
+    {
+        return Err(format!("{label} is invalid."));
+    }
+    Ok(value.into())
+}
+
+fn validate_ssh_username(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.len() > 64
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control() || character == '@')
+    {
+        return Err("SSH username is invalid.".into());
+    }
+    Ok(value.into())
+}
+
+fn validate_identity_file(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let expanded = if value == "~" {
+        dirs::home_dir().unwrap_or_default()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        dirs::home_dir().unwrap_or_default().join(rest)
+    } else {
+        PathBuf::from(value)
+    };
+    if !expanded.is_file() {
+        return Err(format!("Identity file does not exist: {}", expanded.display()));
+    }
+    Ok(Some(
+        expanded
+            .canonicalize()
+            .unwrap_or(expanded)
+            .to_string_lossy()
+            .into_owned(),
+    ))
+}
+
+fn ssh_tunnel_from_input(
+    id: String,
+    created_at: String,
+    input: SshTunnelInput,
+) -> Result<SshTunnel, String> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err("Tunnel name is required.".into());
+    }
+    if input.ssh_port == 0 || input.local_port == 0 || input.remote_port == 0 {
+        return Err("SSH, local, and remote ports must be between 1 and 65535.".into());
+    }
+    Ok(SshTunnel {
+        id,
+        name: name.chars().take(60).collect(),
+        ssh_host: validate_ssh_host(&input.ssh_host, "SSH host")?,
+        ssh_port: input.ssh_port,
+        username: validate_ssh_username(&input.username)?,
+        local_port: input.local_port,
+        remote_host: validate_ssh_host(&input.remote_host, "Remote host")?,
+        remote_port: input.remote_port,
+        identity_file: validate_identity_file(input.identity_file)?,
+        created_at,
+    })
+}
+
+fn ssh_tunnel_view(tunnel: &SshTunnel, running: bool) -> SshTunnelView {
+    SshTunnelView {
+        id: tunnel.id.clone(),
+        name: tunnel.name.clone(),
+        ssh_host: tunnel.ssh_host.clone(),
+        ssh_port: tunnel.ssh_port,
+        username: tunnel.username.clone(),
+        local_port: tunnel.local_port,
+        remote_host: tunnel.remote_host.clone(),
+        remote_port: tunnel.remote_port,
+        identity_file: tunnel.identity_file.clone(),
+        created_at: tunnel.created_at.clone(),
+        running,
+    }
+}
+
+fn ssh_tunnel_command(tunnel: &SshTunnel) -> Command {
+    let remote_host = if tunnel.remote_host.contains(':')
+        && !tunnel.remote_host.starts_with('[')
+    {
+        format!("[{}]", tunnel.remote_host)
+    } else {
+        tunnel.remote_host.clone()
+    };
+    let destination = if tunnel.username.is_empty() {
+        tunnel.ssh_host.clone()
+    } else {
+        format!("{}@{}", tunnel.username, tunnel.ssh_host)
+    };
+    let mut command = Command::new("ssh");
+    command
+        .args([
+            "-N",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-p",
+            &tunnel.ssh_port.to_string(),
+            "-L",
+            &format!(
+                "127.0.0.1:{}:{}:{}",
+                tunnel.local_port, remote_host, tunnel.remote_port
+            ),
+        ]);
+    if let Some(identity_file) = &tunnel.identity_file {
+        command.args(["-i", identity_file]);
+    }
+    command
+        .arg(destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn stop_ssh_tunnel_process(id: &str, state: &RuntimeState) -> Result<(), String> {
+    let mut processes = state
+        .ssh_tunnel_processes
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(mut child) = processes.remove(id) {
+        child
+            .kill()
+            .map_err(|error| format!("Could not stop SSH tunnel: {error}"))?;
+        child
+            .wait()
+            .map_err(|error| format!("Could not finish stopping SSH tunnel: {error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_ssh_tunnels(state: State<'_, RuntimeState>) -> Result<Vec<SshTunnelView>, String> {
+    let running = {
+        let mut processes = state
+            .ssh_tunnel_processes
+            .lock()
+            .map_err(|error| error.to_string())?;
+        processes.retain(|_, child| child.try_wait().is_ok_and(|status| status.is_none()));
+        processes.keys().cloned().collect::<HashSet<_>>()
+    };
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    Ok(store
+        .data
+        .ssh_tunnels
+        .iter()
+        .map(|tunnel| ssh_tunnel_view(tunnel, running.contains(&tunnel.id)))
+        .collect())
+}
+
+#[tauri::command]
+fn create_ssh_tunnel(
+    input: SshTunnelInput,
+    state: State<'_, RuntimeState>,
+) -> Result<SshTunnelView, String> {
+    let tunnel = ssh_tunnel_from_input(short_id(), timestamp(), input)?;
+    let view = ssh_tunnel_view(&tunnel, false);
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
+    store.data.ssh_tunnels.push(tunnel);
+    store.save()?;
+    Ok(view)
+}
+
+#[tauri::command]
+fn update_ssh_tunnel(
+    id: String,
+    input: SshTunnelInput,
+    state: State<'_, RuntimeState>,
+) -> Result<SshTunnelView, String> {
+    {
+        let mut processes = state
+            .ssh_tunnel_processes
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if let Some(child) = processes.get_mut(&id) {
+            if child.try_wait().is_ok_and(|status| status.is_none()) {
+                return Err("Stop the tunnel before editing it.".into());
+            }
+            processes.remove(&id);
+        }
+    }
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
+    let position = store
+        .data
+        .ssh_tunnels
+        .iter()
+        .position(|tunnel| tunnel.id == id)
+        .ok_or("SSH tunnel not found.")?;
+    let tunnel = ssh_tunnel_from_input(
+        id,
+        store.data.ssh_tunnels[position].created_at.clone(),
+        input,
+    )?;
+    let view = ssh_tunnel_view(&tunnel, false);
+    store.data.ssh_tunnels[position] = tunnel;
+    store.save()?;
+    Ok(view)
+}
+
+#[tauri::command]
+fn delete_ssh_tunnel(id: String, state: State<'_, RuntimeState>) -> Result<(), String> {
+    stop_ssh_tunnel_process(&id, &state)?;
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
+    let count = store.data.ssh_tunnels.len();
+    store.data.ssh_tunnels.retain(|tunnel| tunnel.id != id);
+    if store.data.ssh_tunnels.len() == count {
+        return Err("SSH tunnel not found.".into());
+    }
+    store.save()
+}
+
+#[tauri::command]
+fn set_ssh_tunnel_enabled(
+    id: String,
+    enabled: bool,
+    state: State<'_, RuntimeState>,
+) -> Result<SshTunnelView, String> {
+    if !enabled {
+        stop_ssh_tunnel_process(&id, &state)?;
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        let tunnel = store
+            .data
+            .ssh_tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == id)
+            .ok_or("SSH tunnel not found.")?;
+        return Ok(ssh_tunnel_view(tunnel, false));
+    }
+
+    let tunnel = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        store
+            .data
+            .ssh_tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == id)
+            .cloned()
+            .ok_or("SSH tunnel not found.")?
+    };
+    let mut processes = state
+        .ssh_tunnel_processes
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(child) = processes.get_mut(&id) {
+        if child.try_wait().is_ok_and(|status| status.is_none()) {
+            return Ok(ssh_tunnel_view(&tunnel, true));
+        }
+        processes.remove(&id);
+    }
+    let mut child = ssh_tunnel_command(&tunnel)
+        .spawn()
+        .map_err(|error| format!("Could not start ssh: {error}"))?;
+    thread::sleep(Duration::from_millis(180));
+    match child.try_wait() {
+        Ok(None) => {
+            processes.insert(id, child);
+            Ok(ssh_tunnel_view(&tunnel, true))
+        }
+        Ok(Some(status)) => Err(format!(
+            "SSH tunnel exited immediately ({status}). Check the host, key, and forwarded ports."
+        )),
+        Err(error) => {
+            let _ = child.kill();
+            Err(format!("Could not verify SSH tunnel: {error}"))
+        }
+    }
+}
+
+fn docker_browser_url(host_ip: &str, host_port: u16, container_port: u16) -> String {
+    let address = match host_ip {
+        "" | "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        address => address,
+    };
+    let url = browser_url(address, host_port);
+    if container_port == 443 || host_port == 443 || host_port == 8443 || host_port == 9443 {
+        url.replacen("http:", "https:", 1)
+    } else {
+        url
+    }
+}
+
+fn parse_docker_apps(raw: &str) -> Result<Vec<RunningAppGroupView>, String> {
+    let containers: Vec<serde_json::Value> =
+        serde_json::from_str(raw).map_err(|error| format!("Could not read Docker state: {error}"))?;
+    let mut groups = BTreeMap::<String, RunningAppGroupView>::new();
+    for container in containers {
+        let id = container
+            .get("Id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let container_name = container
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(id)
+            .trim_start_matches('/');
+        let labels = container
+            .pointer("/Config/Labels")
+            .and_then(serde_json::Value::as_object);
+        let compose_project = labels
+            .and_then(|labels| labels.get("com.docker.compose.project"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let compose_service = labels
+            .and_then(|labels| labels.get("com.docker.compose.service"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let working_directory = labels
+            .and_then(|labels| labels.get("com.docker.compose.project.working_dir"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let (group_id, group_name, kind, source) = if let Some(project) = compose_project {
+            (
+                format!("compose:{project}"),
+                project.to_owned(),
+                "compose".to_owned(),
+                working_directory.unwrap_or("Docker Compose").to_owned(),
+            )
+        } else {
+            (
+                format!("docker:{}", &id[..id.len().min(12)]),
+                container_name.to_owned(),
+                "container".to_owned(),
+                "Docker container".to_owned(),
+            )
+        };
+
+        let mut ports = BTreeMap::<(u16, u16), RunningAppPortView>::new();
+        if let Some(bindings) = container
+            .pointer("/NetworkSettings/Ports")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (container_endpoint, values) in bindings {
+                let (container_port, protocol) = container_endpoint
+                    .split_once('/')
+                    .unwrap_or((container_endpoint, "tcp"));
+                let Some(container_port) = container_port.parse::<u16>().ok() else {
+                    continue;
+                };
+                let Some(values) = values.as_array() else {
+                    continue;
+                };
+                for binding in values {
+                    let Some(host_port) = binding
+                        .get("HostPort")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|value| value.parse::<u16>().ok())
+                    else {
+                        continue;
+                    };
+                    let host_ip = binding
+                        .get("HostIp")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("127.0.0.1");
+                    let candidate = RunningAppPortView {
+                        url: docker_browser_url(host_ip, host_port, container_port),
+                        label: format!("{host_port} → {container_port}/{protocol}"),
+                    };
+                    ports
+                        .entry((host_port, container_port))
+                        .and_modify(|existing| {
+                            if existing.url.contains("[::1]") && candidate.url.contains("127.0.0.1")
+                            {
+                                *existing = candidate.clone();
+                            }
+                        })
+                        .or_insert(candidate);
+                }
+            }
+        }
+
+        let group = groups
+            .entry(group_id.clone())
+            .or_insert_with(|| RunningAppGroupView {
+                id: group_id,
+                name: group_name,
+                kind,
+                source,
+                services: Vec::new(),
+                opening_url: None,
+                custom_opening_url: false,
+            });
+        group.services.push(RunningAppServiceView {
+            id: id.to_owned(),
+            name: compose_service.unwrap_or(container_name).to_owned(),
+            image: container
+                .pointer("/Config/Image")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            status: container
+                .pointer("/State/Status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("running")
+                .to_owned(),
+            ports: ports.into_values().collect(),
+        });
+    }
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    for group in &mut groups {
+        group.services.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    Ok(groups)
+}
+
+fn docker_running_apps() -> Result<Vec<RunningAppGroupView>, String> {
+    let output = Command::new("docker")
+        .args(["ps", "-q", "--no-trunc"])
+        .output()
+        .map_err(|error| format!("Docker CLI is unavailable: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if detail.is_empty() {
+            "Docker is not available.".into()
+        } else {
+            detail
+        });
+    }
+    let ids = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut command = Command::new("docker");
+    command.arg("inspect").args(&ids);
+    let output = command
+        .output()
+        .map_err(|error| format!("Could not inspect Docker containers: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if detail.is_empty() {
+            "Could not inspect Docker containers.".into()
+        } else {
+            detail
+        });
+    }
+    parse_docker_apps(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn internal_app_process(process: &str) -> bool {
+    matches!(
+        process.to_ascii_lowercase().as_str(),
+        "omp"
+            | "chrome"
+            | "chromium"
+            | "chromium-browser"
+            | "google-chrome"
+            | "chromedriver"
+    )
+}
+
+fn local_running_apps(
+    projects: &[Project],
+    snapshots: &HashMap<String, RuntimeSnapshot>,
+) -> Vec<RunningAppGroupView> {
+    projects
+        .iter()
+        .filter_map(|project| {
+            let services = project
+                .windows
+                .iter()
+                .filter_map(|window| {
+                    let snapshot = snapshots.get(&window.id)?;
+                    if !snapshot.running || snapshot.ports.is_empty() {
+                        return None;
+                    }
+                    let ports = snapshot
+                        .ports
+                        .iter()
+                        .filter(|port| !internal_app_process(&port.process))
+                        .map(|port| RunningAppPortView {
+                            url: port.url.clone(),
+                            label: format!(":{} · {}", port.port, port.process),
+                        })
+                        .collect::<Vec<_>>();
+                    if ports.is_empty() {
+                        return None;
+                    }
+                    Some(RunningAppServiceView {
+                        id: window.id.clone(),
+                        name: window.name.clone(),
+                        image: None,
+                        status: snapshot
+                            .current_command
+                            .clone()
+                            .unwrap_or_else(|| "listening".into()),
+                        ports,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!services.is_empty()).then(|| RunningAppGroupView {
+                id: format!("project:{}", project.id),
+                name: project.name.clone(),
+                kind: "project".into(),
+                source: project.cwd.clone(),
+                services,
+                opening_url: None,
+                custom_opening_url: false,
+            })
+        })
+        .collect()
+}
+
+fn apply_opening_urls(
+    groups: &mut [RunningAppGroupView],
+    opening_urls: &BTreeMap<String, String>,
+) {
+    for group in groups {
+        if let Some(url) = opening_urls.get(&group.id) {
+            group.opening_url = Some(url.clone());
+            group.custom_opening_url = true;
+        } else {
+            group.opening_url = group
+                .services
+                .iter()
+                .flat_map(|service| &service.ports)
+                .next()
+                .map(|port| port.url.clone());
+            group.custom_opening_url = false;
+        }
+    }
+}
+
+fn validate_opening_url(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let Some(remainder) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    else {
+        return Err("Opening URL must start with http:// or https://.".into());
+    };
+    if remainder.is_empty()
+        || value.len() > 2_048
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("Opening URL is invalid.".into());
+    }
+    Ok(value.into())
+}
+
+#[tauri::command]
+fn get_running_apps(state: State<'_, RuntimeState>) -> Result<RunningAppsView, String> {
+    let (projects, opening_urls) = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        (
+            store.data.projects.clone(),
+            store.data.app_opening_urls.clone(),
+        )
+    };
+    let snapshots = state
+        .snapshots
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let mut groups = local_running_apps(&projects, &snapshots);
+    let docker_error = match docker_running_apps() {
+        Ok(mut docker_groups) => {
+            groups.append(&mut docker_groups);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    groups.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    apply_opening_urls(&mut groups, &opening_urls);
+    let service_count = groups.iter().map(|group| group.services.len()).sum();
+    Ok(RunningAppsView {
+        groups,
+        service_count,
+        docker_error,
+    })
+}
+
+#[tauri::command]
+fn set_app_opening_url(
+    group_id: String,
+    url: String,
+    state: State<'_, RuntimeState>,
+) -> Result<Option<String>, String> {
+    if group_id.len() > 300
+        || !["compose:", "docker:", "project:"]
+            .iter()
+            .any(|prefix| group_id.starts_with(prefix))
+        || group_id
+            .chars()
+            .any(|character| character.is_control())
+    {
+        return Err("Application group id is invalid.".into());
+    }
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
+    let url = if url.trim().is_empty() {
+        store.data.app_opening_urls.remove(&group_id);
+        None
+    } else {
+        let url = validate_opening_url(&url)?;
+        store
+            .data
+            .app_opening_urls
+            .insert(group_id, url.clone());
+        Some(url)
+    };
+    store.save()?;
+    Ok(url)
+}
+
 #[tauri::command]
 fn set_compact_mode(
     enabled: bool,
@@ -2938,6 +3669,7 @@ pub fn run() {
                 history_modes: Mutex::new(HashSet::new()),
                 snapshots: Mutex::new(HashMap::new()),
                 omp_states: Mutex::new(HashMap::new()),
+                ssh_tunnel_processes: Mutex::new(HashMap::new()),
                 compact_window: Mutex::new(None),
                 app_data_dir,
             });
@@ -2947,10 +3679,19 @@ pub fn run() {
             if !matches!(event, tauri::WindowEvent::Destroyed) {
                 return;
             }
+            let state = window.state::<RuntimeState>();
+            if window.label() == "main" {
+                if let Ok(mut processes) = state.ssh_tunnel_processes.lock() {
+                    for (_, mut child) in processes.drain() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+                return;
+            }
             let Some(id) = window.label().strip_prefix("chat-") else {
                 return;
             };
-            let state = window.state::<RuntimeState>();
             stop_connection(id, &state);
             if let Some(main) = window.app_handle().get_webview_window("main") {
                 let _ = main.emit("chat-popout-closed", id);
@@ -2959,6 +3700,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_projects,
+            get_ssh_tunnels,
+            create_ssh_tunnel,
+            update_ssh_tunnel,
+            delete_ssh_tunnel,
+            set_ssh_tunnel_enabled,
+            get_running_apps,
+            set_app_opening_url,
             get_git_status,
             switch_git_branch,
             pull_git,
@@ -3044,8 +3792,10 @@ mod tests {
     #[test]
     fn migrates_empty_flat_store() {
         let migrated = migrate_store(r#"{"agents":[]}"#).unwrap();
-        assert_eq!(migrated.version, 5);
+        assert_eq!(migrated.version, 7);
         assert!(migrated.projects.is_empty());
+        assert!(migrated.ssh_tunnels.is_empty());
+        assert!(migrated.app_opening_urls.is_empty());
     }
 
     #[test]
@@ -3065,6 +3815,187 @@ mod tests {
         assert_eq!(migrated.projects[0].default_command, "omp");
         assert_eq!(migrated.projects[1].default_command, "codex --model gpt-5");
         assert_eq!(get_config()["defaultCommand"], "omp");
+    }
+
+    #[test]
+    fn validates_tunnel_fields_and_builds_literal_ssh_arguments() {
+        let tunnel = ssh_tunnel_from_input(
+            "tunnel".into(),
+            "now".into(),
+            SshTunnelInput {
+                name: "  Production database  ".into(),
+                ssh_host: "bastion.example.com".into(),
+                ssh_port: 2222,
+                username: "deploy".into(),
+                local_port: 5433,
+                remote_host: "2001:db8::2".into(),
+                remote_port: 5432,
+                identity_file: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(tunnel.name, "Production database");
+        let command = ssh_tunnel_command(&tunnel);
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-L", "127.0.0.1:5433:[2001:db8::2]:5432"]));
+        assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]));
+        assert_eq!(args.last().map(String::as_str), Some("deploy@bastion.example.com"));
+
+        let invalid = ssh_tunnel_from_input(
+            "bad".into(),
+            "now".into(),
+            SshTunnelInput {
+                name: "Bad".into(),
+                ssh_host: "-oProxyCommand=bad".into(),
+                ssh_port: 22,
+                username: String::new(),
+                local_port: 1,
+                remote_host: "localhost".into(),
+                remote_port: 1,
+                identity_file: None,
+            },
+        );
+        assert_eq!(invalid.unwrap_err(), "SSH host is invalid.");
+    }
+
+    #[test]
+    fn groups_compose_containers_and_selects_opening_urls() {
+        let raw = r#"[
+          {
+            "Id":"aaaaaaaaaaaaaaaa",
+            "Name":"/demo-api-1",
+            "Config":{"Image":"demo-api:latest","Labels":{
+              "com.docker.compose.project":"demo",
+              "com.docker.compose.service":"api",
+              "com.docker.compose.project.working_dir":"/work/demo"
+            }},
+            "State":{"Status":"running"},
+            "NetworkSettings":{"Ports":{"3000/tcp":[
+              {"HostIp":"::","HostPort":"8080"},
+              {"HostIp":"0.0.0.0","HostPort":"8080"}
+            ]}}
+          },
+          {
+            "Id":"bbbbbbbbbbbbbbbb",
+            "Name":"/demo-db-1",
+            "Config":{"Image":"postgres:17","Labels":{
+              "com.docker.compose.project":"demo",
+              "com.docker.compose.service":"db",
+              "com.docker.compose.project.working_dir":"/work/demo"
+            }},
+            "State":{"Status":"running"},
+            "NetworkSettings":{"Ports":{"5432/tcp":null}}
+          },
+          {
+            "Id":"cccccccccccccccc",
+            "Name":"/standalone",
+            "Config":{"Image":"nginx:latest","Labels":{}},
+            "State":{"Status":"running"},
+            "NetworkSettings":{"Ports":{"443/tcp":[
+              {"HostIp":"0.0.0.0","HostPort":"8443"}
+            ]}}
+          }
+        ]"#;
+        let mut groups = parse_docker_apps(raw).unwrap();
+        assert_eq!(groups.len(), 2);
+        let compose = groups
+            .iter()
+            .find(|group| group.id == "compose:demo")
+            .unwrap();
+        assert_eq!(compose.services.len(), 2);
+        assert_eq!(compose.services[0].name, "api");
+        assert_eq!(
+            compose.services[0].ports,
+            [RunningAppPortView {
+                url: "http://127.0.0.1:8080".into(),
+                label: "8080 → 3000/tcp".into(),
+            }]
+        );
+        let standalone = groups
+            .iter()
+            .find(|group| group.id == "docker:cccccccccccc")
+            .unwrap();
+        assert_eq!(standalone.services[0].ports[0].url, "https://127.0.0.1:8443");
+
+        let defaults = BTreeMap::from([(
+            "compose:demo".into(),
+            "https://demo.local".into(),
+        )]);
+        apply_opening_urls(&mut groups, &defaults);
+        let compose = groups
+            .iter()
+            .find(|group| group.id == "compose:demo")
+            .unwrap();
+        assert_eq!(compose.opening_url.as_deref(), Some("https://demo.local"));
+        assert!(compose.custom_opening_url);
+        assert_eq!(
+            validate_opening_url("  http://127.0.0.1:3000/path  ").unwrap(),
+            "http://127.0.0.1:3000/path"
+        );
+        assert!(validate_opening_url("javascript:alert(1)").is_err());
+        assert!(validate_opening_url("https://bad host").is_err());
+    }
+
+    #[test]
+    fn excludes_omp_and_browser_listeners_from_local_apps() {
+        let project: Project = serde_json::from_str(
+            r#"{
+              "id":"project",
+              "name":"Project",
+              "cwd":"/tmp",
+              "createdAt":"now",
+              "windows":[
+                {"id":"mixed","sessionName":"mixed","name":"Dev server","cwd":"/tmp","kind":"terminal","createdAt":"now"},
+                {"id":"internal","sessionName":"internal","name":"Agent","cwd":"/tmp","kind":"agent","createdAt":"now"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let port = |port, process: &str| PortView {
+            port,
+            address: "127.0.0.1".into(),
+            url: format!("http://127.0.0.1:{port}"),
+            pid: port.into(),
+            process: process.into(),
+        };
+        let snapshots = HashMap::from([
+            (
+                "mixed".into(),
+                RuntimeSnapshot {
+                    running: true,
+                    ports: vec![
+                        port(36_253, "omp"),
+                        port(35_913, "chrome"),
+                        port(3_000, "node"),
+                    ],
+                    ..RuntimeSnapshot::default()
+                },
+            ),
+            (
+                "internal".into(),
+                RuntimeSnapshot {
+                    running: true,
+                    ports: vec![port(39_103, "OMP"), port(39_247, "chromium")],
+                    ..RuntimeSnapshot::default()
+                },
+            ),
+        ]);
+        let groups = local_running_apps(&[project], &snapshots);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].services.len(), 1);
+        assert_eq!(groups[0].services[0].name, "Dev server");
+        assert_eq!(
+            groups[0].services[0].ports,
+            [RunningAppPortView {
+                url: "http://127.0.0.1:3000".into(),
+                label: ":3000 · node".into(),
+            }]
+        );
     }
 
     #[test]

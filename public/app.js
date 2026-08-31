@@ -48,12 +48,25 @@ const markdownViewToggle = document.querySelector("#markdown-view-toggle");
 const repositoryCopyButton = document.querySelector("#repository-copy-button");
 const preferredEditorSelect = document.querySelector("#preferred-editor-select");
 const preferredEditorCustom = document.querySelector("#preferred-editor-custom");
+const sshTunnelsView = document.querySelector("#ssh-tunnels-view");
+const sshTunnelsList = document.querySelector("#ssh-tunnels-list");
+const sshTunnelDialog = document.querySelector("#ssh-tunnel-dialog");
+const sshTunnelForm = document.querySelector("#ssh-tunnel-form");
+const sshTunnelsButton = document.querySelector("#ssh-tunnels-button");
+const runningAppsView = document.querySelector("#running-apps-view");
+const runningAppsList = document.querySelector("#running-apps-list");
+const runningAppsButton = document.querySelector("#running-apps-button");
 const terminals = new Map();
 const sidebarWidthKey = "agent-grid-sidebar-width";
 const projectSectionShareKey = "agent-grid-projects-share";
 const legacyProjectSectionHeightKey = "agent-grid-projects-height";
 const preferredEditorKey = "agent-grid-preferred-editor";
 const preferredEditorCustomKey = "agent-grid-preferred-editor-custom";
+const shortcutStorageKey = "agent-grid-keyboard-shortcuts";
+const defaultShortcutBindings = Object.freeze({
+  windowFocus: Object.freeze({ ctrl: false, alt: true, shift: false, meta: false }),
+  projectSwitch: Object.freeze({ ctrl: true, alt: true, shift: false, meta: false })
+});
 
 let projects = [];
 let activeProjectId = localStorage.getItem("agent-grid-project");
@@ -102,6 +115,16 @@ let gitGraphCommits = [];
 let gitGraphTruncated = false;
 let gitGraphProjectId = null;
 let selectedGitCommitHash = null;
+let sshTunnels = [];
+let editingSshTunnelId = null;
+let sshTunnelsTimer;
+let runningApps = { groups: [], serviceCount: 0, dockerError: null };
+let runningAppsTimer;
+let runningAppsRequestInFlight = false;
+const appOpeningDrafts = new Map();
+let shortcutBindings = loadShortcutBindings();
+let recordingShortcut = null;
+let projectSwitchInFlight = false;
 
 const activityQuietMs = 5000;
 
@@ -231,6 +254,130 @@ function escapeHtml(value) {
 function shortPath(value) {
   const home = config.defaultCwd.replace(/\/projects\/?$/, "");
   return value.startsWith(home) ? `~${value.slice(home.length)}` : value;
+}
+
+function normalizedShortcutBinding(value, fallback) {
+  const binding = {
+    ctrl: Boolean(value?.ctrl),
+    alt: Boolean(value?.alt),
+    shift: Boolean(value?.shift),
+    meta: Boolean(value?.meta)
+  };
+  return Object.values(binding).some(Boolean) ? binding : { ...fallback };
+}
+
+function shortcutBindingId(binding) {
+  return [binding.ctrl, binding.alt, binding.shift, binding.meta].map(Number).join("");
+}
+
+function loadShortcutBindings() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(shortcutStorageKey) || "{}");
+    const bindings = {
+      windowFocus: normalizedShortcutBinding(stored.windowFocus, defaultShortcutBindings.windowFocus),
+      projectSwitch: normalizedShortcutBinding(stored.projectSwitch, defaultShortcutBindings.projectSwitch)
+    };
+    if (shortcutBindingId(bindings.windowFocus) === shortcutBindingId(bindings.projectSwitch)) {
+      bindings.projectSwitch = { ...defaultShortcutBindings.projectSwitch };
+    }
+    return bindings;
+  } catch {
+    return {
+      windowFocus: { ...defaultShortcutBindings.windowFocus },
+      projectSwitch: { ...defaultShortcutBindings.projectSwitch }
+    };
+  }
+}
+
+function shortcutBindingLabel(binding) {
+  const parts = [];
+  if (binding.ctrl) parts.push("Ctrl");
+  if (binding.alt) parts.push("Alt");
+  if (binding.shift) parts.push("Shift");
+  if (binding.meta) parts.push("Super");
+  return `${parts.join(" + ")} + Arrow keys`;
+}
+
+function updateShortcutControls() {
+  document.querySelectorAll("[data-shortcut-record]").forEach((button) => {
+    const action = button.dataset.shortcutRecord;
+    const recording = action === recordingShortcut;
+    button.classList.toggle("recording", recording);
+    button.setAttribute("aria-pressed", String(recording));
+    button.textContent = recording ? "Press modifiers + arrow…" : shortcutBindingLabel(shortcutBindings[action]);
+  });
+}
+
+function beginShortcutRecording(action) {
+  recordingShortcut = recordingShortcut === action ? null : action;
+  updateShortcutControls();
+}
+
+function cancelShortcutRecording() {
+  if (!recordingShortcut) return;
+  recordingShortcut = null;
+  updateShortcutControls();
+}
+
+function resetShortcutBinding(action) {
+  shortcutBindings[action] = { ...defaultShortcutBindings[action] };
+  if (shortcutBindingId(shortcutBindings.windowFocus) === shortcutBindingId(shortcutBindings.projectSwitch)) {
+    const other = action === "windowFocus" ? "projectSwitch" : "windowFocus";
+    shortcutBindings[other] = { ...defaultShortcutBindings[other] };
+  }
+  localStorage.setItem(shortcutStorageKey, JSON.stringify(shortcutBindings));
+  cancelShortcutRecording();
+  updateShortcutControls();
+  showToast("Keyboard shortcut reset.");
+}
+
+function modifierBindingFromEvent(event) {
+  return {
+    ctrl: event.ctrlKey,
+    alt: event.altKey,
+    shift: event.shiftKey,
+    meta: event.metaKey
+  };
+}
+
+function matchesShortcutBinding(event, binding) {
+  return event.ctrlKey === binding.ctrl
+    && event.altKey === binding.alt
+    && event.shiftKey === binding.shift
+    && event.metaKey === binding.meta;
+}
+
+function handleShortcutRecording(event) {
+  if (!recordingShortcut) return false;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    cancelShortcutRecording();
+    return true;
+  }
+  if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) return true;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if (!event.key.startsWith("Arrow")) {
+    showToast("Press at least one modifier with an arrow key.", true);
+    return true;
+  }
+  const binding = modifierBindingFromEvent(event);
+  if (!Object.values(binding).some(Boolean)) {
+    showToast("A navigation shortcut needs at least one modifier.", true);
+    return true;
+  }
+  const other = recordingShortcut === "windowFocus" ? "projectSwitch" : "windowFocus";
+  if (shortcutBindingId(binding) === shortcutBindingId(shortcutBindings[other])) {
+    showToast("That modifier combination is already assigned.", true);
+    return true;
+  }
+  shortcutBindings[recordingShortcut] = binding;
+  localStorage.setItem(shortcutStorageKey, JSON.stringify(shortcutBindings));
+  recordingShortcut = null;
+  updateShortcutControls();
+  showToast("Keyboard shortcut saved.");
+  return true;
 }
 
 function showToast(message, isError = false) {
@@ -791,6 +938,10 @@ async function connectTerminal(window) {
   terminal.loadAddon(fitAddon);
   terminal.open(container);
   fitAddon.fit();
+  container.addEventListener("focusin", () => {
+    selectedWindowId = window.id;
+    renderCompactNavigation();
+  });
 
   const entry = {
     terminal, fitAddon, observer: null, inputBuffer: "", inputTimer: null, resizeTimer: null,
@@ -1338,6 +1489,282 @@ async function refreshRepository() {
   }
 }
 
+function sshTunnelDestination(tunnel) {
+  return tunnel.username ? `${tunnel.username}@${tunnel.sshHost}` : tunnel.sshHost;
+}
+
+function renderSshTunnels() {
+  const runningCount = sshTunnels.filter((tunnel) => tunnel.running).length;
+  document.querySelector("#ssh-tunnels-count").textContent = String(runningCount);
+  document.querySelector("#ssh-tunnels-count").classList.toggle("active", runningCount > 0);
+  document.querySelector("#ssh-tunnels-summary").textContent = sshTunnels.length
+    ? `${runningCount} active · ${sshTunnels.length} defined`
+    : "No tunnels defined";
+  if (!sshTunnels.length) {
+    sshTunnelsList.innerHTML = `<div class="ssh-tunnels-empty">
+      <span aria-hidden="true">⇄</span>
+      <strong>No routes defined</strong>
+      <p>Add a tunnel to forward a local port through an SSH host.</p>
+      <button class="button primary" type="button" data-tunnel-action="new">Define first tunnel</button>
+    </div>`;
+    return;
+  }
+  sshTunnelsList.innerHTML = sshTunnels.map((tunnel) => `
+    <article class="ssh-tunnel-card ${tunnel.running ? "running" : ""}" data-tunnel-id="${escapeHtml(tunnel.id)}">
+      <div class="ssh-tunnel-card-header">
+        <div class="ssh-tunnel-name">
+          <span class="status-dot ${tunnel.running ? "running" : ""}"></span>
+          <span>
+            <strong>${escapeHtml(tunnel.name)}</strong>
+            <small>via ${escapeHtml(sshTunnelDestination(tunnel))}:${tunnel.sshPort}</small>
+          </span>
+        </div>
+        <label class="ssh-tunnel-switch">
+          <input type="checkbox" data-tunnel-toggle="${escapeHtml(tunnel.id)}" ${tunnel.running ? "checked" : ""}>
+          <span aria-hidden="true"></span>
+          <em>${tunnel.running ? "On" : "Off"}</em>
+        </label>
+      </div>
+      <div class="ssh-tunnel-route">
+        <div>
+          <small>LOCAL</small>
+          <code>127.0.0.1:${tunnel.localPort}</code>
+        </div>
+        <span class="ssh-tunnel-route-line" aria-hidden="true"><i></i></span>
+        <div>
+          <small>TARGET</small>
+          <code>${escapeHtml(tunnel.remoteHost)}:${tunnel.remotePort}</code>
+        </div>
+      </div>
+      <div class="ssh-tunnel-card-footer">
+        <span>${tunnel.identityFile ? `Key · ${escapeHtml(tunnel.identityFile)}` : "SSH agent or config"}</span>
+        <div>
+          <button class="button ghost" type="button" data-tunnel-action="edit" ${tunnel.running ? "disabled" : ""}>Edit</button>
+          <button class="button ghost danger" type="button" data-tunnel-action="delete">Delete</button>
+        </div>
+      </div>
+    </article>
+  `).join("");
+}
+
+async function refreshSshTunnels({ quiet = false } = {}) {
+  try {
+    sshTunnels = await call("get_ssh_tunnels");
+    renderSshTunnels();
+    if (!quiet) showToast("Tunnel status refreshed.");
+  } catch (error) {
+    if (!quiet) showToast(error.message, true);
+  }
+}
+
+function scheduleSshTunnelPoll() {
+  clearTimeout(sshTunnelsTimer);
+  if (sshTunnelsView.hidden) return;
+  sshTunnelsTimer = setTimeout(async () => {
+    await refreshSshTunnels({ quiet: true });
+    scheduleSshTunnelPoll();
+  }, 3000);
+}
+
+async function openSshTunnels() {
+  if (popoutWindowId) return;
+  closeRunningApps();
+  if (!repositoryBrowser.hidden) closeRepository();
+  closeActivityPanel();
+  grid.hidden = true;
+  sshTunnelsView.hidden = false;
+  sshTunnelsButton.classList.add("active");
+  sshTunnelsButton.setAttribute("aria-pressed", "true");
+  await refreshSshTunnels({ quiet: true });
+  scheduleSshTunnelPoll();
+}
+
+function closeSshTunnels() {
+  if (sshTunnelsView.hidden) return;
+  clearTimeout(sshTunnelsTimer);
+  sshTunnelsView.hidden = true;
+  grid.hidden = false;
+  sshTunnelsButton.classList.remove("active");
+  sshTunnelsButton.setAttribute("aria-pressed", "false");
+  requestAnimationFrame(() => terminals.forEach((entry) => entry.fitAddon.fit()));
+}
+
+function openSshTunnelModal(tunnel = null) {
+  editingSshTunnelId = tunnel?.id || null;
+  document.querySelector("#ssh-tunnel-dialog-eyebrow").textContent = tunnel ? "Edit route" : "New route";
+  document.querySelector("#ssh-tunnel-dialog-title").textContent = tunnel ? tunnel.name : "Define SSH tunnel";
+  document.querySelector("#save-ssh-tunnel-button").textContent = tunnel ? "Save changes" : "Save tunnel";
+  document.querySelector("#ssh-tunnel-name").value = tunnel?.name || "";
+  document.querySelector("#ssh-tunnel-host").value = tunnel?.sshHost || "";
+  document.querySelector("#ssh-tunnel-ssh-port").value = tunnel?.sshPort || 22;
+  document.querySelector("#ssh-tunnel-username").value = tunnel?.username || "";
+  document.querySelector("#ssh-tunnel-identity").value = tunnel?.identityFile || "";
+  document.querySelector("#ssh-tunnel-local-port").value = tunnel?.localPort || "";
+  document.querySelector("#ssh-tunnel-remote-host").value = tunnel?.remoteHost || "127.0.0.1";
+  document.querySelector("#ssh-tunnel-remote-port").value = tunnel?.remotePort || "";
+  sshTunnelDialog.showModal();
+  document.querySelector("#ssh-tunnel-name").focus();
+}
+
+async function setSshTunnelEnabled(id, enabled, input) {
+  input.disabled = true;
+  try {
+    await call("set_ssh_tunnel_enabled", { id, enabled });
+    await refreshSshTunnels({ quiet: true });
+    showToast(`Tunnel ${enabled ? "started" : "stopped"}.`);
+  } catch (error) {
+    await refreshSshTunnels({ quiet: true });
+    showToast(error.message, true);
+  }
+}
+
+async function deleteSshTunnel(id) {
+  const tunnel = sshTunnels.find((item) => item.id === id);
+  if (!tunnel || !window.confirm(`Delete SSH tunnel “${tunnel.name}”?`)) return;
+  try {
+    await call("delete_ssh_tunnel", { id });
+    await refreshSshTunnels({ quiet: true });
+    showToast("Tunnel deleted.");
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
+function runningAppKind(group) {
+  if (group.kind === "compose") return { icon: "≋", label: "Docker Compose" };
+  if (group.kind === "project") return { icon: "›_", label: "Agent Grid project" };
+  return { icon: "◇", label: "Docker container" };
+}
+
+function renderRunningApps() {
+  const groupCount = runningApps.groups.length;
+  const serviceCount = runningApps.serviceCount || 0;
+  document.querySelector("#running-apps-count").textContent = String(serviceCount);
+  document.querySelector("#running-apps-count").classList.toggle("active", serviceCount > 0);
+  document.querySelector("#running-apps-summary").textContent = serviceCount
+    ? `${serviceCount} running · ${groupCount} ${groupCount === 1 ? "group" : "groups"}`
+    : "Nothing detected";
+  document.querySelector("#running-apps-service-total").textContent = String(serviceCount);
+  document.querySelector("#running-apps-group-total").textContent = String(groupCount);
+  const warning = document.querySelector("#running-apps-docker-warning");
+  warning.hidden = !runningApps.dockerError;
+  warning.textContent = runningApps.dockerError ? `Docker: ${runningApps.dockerError}` : "";
+  if (!groupCount) {
+    runningAppsList.innerHTML = `<div class="running-apps-empty">
+      <span aria-hidden="true">◫</span>
+      <strong>No applications detected</strong>
+      <p>Start a Docker container or a local service inside an Agent Grid terminal.</p>
+    </div>`;
+    return;
+  }
+  runningAppsList.innerHTML = runningApps.groups.map((group) => {
+    const kind = runningAppKind(group);
+    const openingUrl = appOpeningDrafts.has(group.id)
+      ? appOpeningDrafts.get(group.id)
+      : group.openingUrl || "";
+    return `
+      <article class="running-app-group ${escapeHtml(group.kind)}" data-app-group="${escapeHtml(group.id)}">
+        <header class="running-app-group-header">
+          <span class="running-app-group-icon" aria-hidden="true">${kind.icon}</span>
+          <div>
+            <div class="running-app-group-title">
+              <strong>${escapeHtml(group.name)}</strong>
+              <span>${group.services.length} ${group.services.length === 1 ? "service" : "services"}</span>
+            </div>
+            <small>${escapeHtml(kind.label)} · ${escapeHtml(shortPath(group.source))}</small>
+          </div>
+        </header>
+        <div class="running-app-services">
+          ${group.services.map((service) => `
+            <div class="running-app-service">
+              <span class="status-dot running"></span>
+              <div class="running-app-service-copy">
+                <strong>${escapeHtml(service.name)}</strong>
+                <small>${escapeHtml(service.image || service.status)}</small>
+              </div>
+              <div class="running-app-ports">
+                ${service.ports.length ? service.ports.map((port) => `
+                  <button type="button" data-open-app-url="${escapeHtml(port.url)}" title="Open ${escapeHtml(port.url)}">${escapeHtml(port.label)}</button>
+                `).join("") : `<span>No published port</span>`}
+              </div>
+            </div>
+          `).join("")}
+        </div>
+        <form class="app-opening-form" data-app-opening-form="${escapeHtml(group.id)}">
+          <label>
+            <span>DEFAULT OPENING URL ${group.customOpeningUrl ? "· CUSTOM" : "· AUTO"}</span>
+            <input class="app-opening-url" name="url" type="url" value="${escapeHtml(openingUrl)}" placeholder="http://127.0.0.1:3000" spellcheck="false">
+          </label>
+          <button class="button ghost" type="submit">Save</button>
+          <button class="button primary" type="button" data-open-app-url="${escapeHtml(openingUrl)}" ${openingUrl ? "" : "disabled"}>Open</button>
+        </form>
+      </article>
+    `;
+  }).join("");
+}
+
+async function refreshRunningApps({ quiet = false } = {}) {
+  if (popoutWindowId || runningAppsRequestInFlight) return;
+  runningAppsRequestInFlight = true;
+  try {
+    runningApps = await call("get_running_apps");
+    renderRunningApps();
+    if (!quiet) showToast("Running applications refreshed.");
+  } catch (error) {
+    if (!quiet) showToast(error.message, true);
+  } finally {
+    runningAppsRequestInFlight = false;
+  }
+}
+
+function scheduleRunningAppsPoll() {
+  clearTimeout(runningAppsTimer);
+  if (popoutWindowId) return;
+  runningAppsTimer = setTimeout(async () => {
+    if (!document.hidden) await refreshRunningApps({ quiet: true });
+    scheduleRunningAppsPoll();
+  }, 5000);
+}
+
+async function openRunningApps() {
+  if (popoutWindowId) return;
+  if (!repositoryBrowser.hidden) closeRepository();
+  closeSshTunnels();
+  closeActivityPanel();
+  grid.hidden = true;
+  runningAppsView.hidden = false;
+  runningAppsButton.classList.add("active");
+  runningAppsButton.setAttribute("aria-pressed", "true");
+  await refreshRunningApps({ quiet: true });
+}
+
+function closeRunningApps() {
+  if (runningAppsView.hidden) return;
+  runningAppsView.hidden = true;
+  grid.hidden = false;
+  runningAppsButton.classList.remove("active");
+  runningAppsButton.setAttribute("aria-pressed", "false");
+  requestAnimationFrame(() => terminals.forEach((entry) => entry.fitAddon.fit()));
+}
+
+async function saveAppOpeningUrl(form) {
+  const groupId = form.dataset.appOpeningForm;
+  const input = form.querySelector(".app-opening-url");
+  const button = form.querySelector('[type="submit"]');
+  button.disabled = true;
+  try {
+    await call("set_app_opening_url", { groupId, url: input.value });
+    appOpeningDrafts.delete(groupId);
+    await refreshRunningApps({ quiet: true });
+    showToast(input.value.trim() ? "Default opening URL saved." : "Default opening URL reset.");
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+
 async function openRepository(projectId = activeProjectId) {
   if (!projectId || popoutWindowId) return;
   if (projectId !== activeProjectId) {
@@ -1347,6 +1774,8 @@ async function openRepository(projectId = activeProjectId) {
     await refreshGitStatus({ quiet: true });
   }
   closeActivityPanel();
+  closeSshTunnels();
+  closeRunningApps();
   grid.hidden = true;
   repositoryBrowser.hidden = false;
   document.querySelector("#repository-button").classList.add("active");
@@ -1792,6 +2221,53 @@ function applyMaximizedWindow(id) {
   requestAnimationFrame(() => terminals.forEach((entry) => entry.fitAddon.fit()));
 }
 
+function focusWindowInDirection(direction) {
+  if (grid.hidden) return;
+  const cards = [...grid.querySelectorAll(".terminal-card[data-window-id]")]
+    .filter((card) => terminals.has(card.dataset.windowId))
+    .map((card) => {
+      const rect = card.closest(".tile-leaf").getBoundingClientRect();
+      return {
+        id: card.dataset.windowId,
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height
+      };
+    });
+  if (cards.length < 2) return;
+  const focusedId = document.activeElement?.closest(".terminal-card")?.dataset.windowId;
+  const currentId = focusedId || selectedWindowId || cards[0].id;
+  const nextId = UiLayout.directionalNeighbor(cards, currentId, direction);
+  const entry = terminals.get(nextId);
+  if (!entry) return;
+  selectedWindowId = nextId;
+  if (compactMode || maximizedWindowId) applyMaximizedWindow(nextId);
+  renderCompactNavigation();
+  entry.terminal.focus();
+}
+
+async function switchProjectInDirection(direction) {
+  if (grid.hidden || popoutWindowId || projectSwitchInFlight || projects.length < 2) return;
+  const currentIndex = Math.max(0, projects.findIndex((project) => project.id === activeProjectId));
+  const step = direction === "left" || direction === "up" ? -1 : 1;
+  const target = projects[(currentIndex + step + projects.length) % projects.length];
+  if (!target || target.id === activeProjectId) return;
+  projectSwitchInFlight = true;
+  try {
+    activeProjectId = target.id;
+    localStorage.setItem("agent-grid-project", activeProjectId);
+    selectedWindowId = target.windows.find((window) => !poppedOutWindowIds.has(window.id))?.id
+      || target.windows[0]?.id
+      || null;
+    await render();
+    await refreshGitStatus({ quiet: true });
+    terminals.get(selectedWindowId)?.terminal.focus();
+  } finally {
+    projectSwitchInFlight = false;
+  }
+}
+
 function toggleMaximize(card) {
   if (compactMode) return;
   applyMaximizedWindow(maximizedWindowId === card.dataset.windowId ? null : card.dataset.windowId);
@@ -1811,6 +2287,8 @@ async function setCompactMode(enabled) {
     if (enabled) {
       if (workspace.classList.contains("activity-open")) closeActivityPanel();
       if (!repositoryBrowser.hidden) closeRepository();
+      if (!sshTunnelsView.hidden) closeSshTunnels();
+      if (!runningAppsView.hidden) closeRunningApps();
       compactPreviousMaximizedId = maximizedWindowId;
       selectedWindowId ||= activeWindows()[0]?.id || null;
       applyMaximizedWindow(selectedWindowId);
@@ -1875,6 +2353,7 @@ async function returnPoppedOutChat(id) {
 function openSettings() {
   updateFontControls();
   updateEditorControls();
+  updateShortcutControls();
   settingsDialog.showModal();
 }
 
@@ -1884,6 +2363,8 @@ document.querySelector("#activity-button").addEventListener("click", () => {
   if (workspace.classList.contains("activity-open")) closeActivityPanel();
   else {
     closeRepository();
+    closeSshTunnels();
+    closeRunningApps();
     openActivityPanel();
   }
 });
@@ -1895,9 +2376,56 @@ document.querySelector("#more-columns-button").addEventListener("click", () => r
 document.querySelector("#compact-mode-button").addEventListener("click", () => setCompactMode(!compactMode));
 document.querySelector("#settings-button").addEventListener("click", openSettings);
 document.querySelector("#terminal-font-size-range").addEventListener("input", (event) => setTerminalFontSize(event.target.value));
+settingsDialog.addEventListener("click", (event) => {
+  const record = event.target.closest("[data-shortcut-record]")?.dataset.shortcutRecord;
+  if (record) return beginShortcutRecording(record);
+  const reset = event.target.closest("[data-shortcut-reset]")?.dataset.shortcutReset;
+  if (reset) resetShortcutBinding(reset);
+});
+settingsDialog.addEventListener("close", cancelShortcutRecording);
 document.querySelector("#repository-button").addEventListener("click", () => {
   if (repositoryBrowser.hidden) openRepository();
   else closeRepository();
+});
+runningAppsButton.addEventListener("click", () => {
+  if (runningAppsView.hidden) openRunningApps();
+  else closeRunningApps();
+});
+document.querySelector("#running-apps-close-button").addEventListener("click", closeRunningApps);
+document.querySelector("#running-apps-refresh-button").addEventListener("click", () => refreshRunningApps());
+runningAppsList.addEventListener("click", (event) => {
+  const url = event.target.closest("[data-open-app-url]")?.dataset.openAppUrl;
+  if (url) openPort(url);
+});
+runningAppsList.addEventListener("input", (event) => {
+  if (!event.target.matches(".app-opening-url")) return;
+  const groupId = event.target.closest("[data-app-opening-form]")?.dataset.appOpeningForm;
+  if (groupId) appOpeningDrafts.set(groupId, event.target.value);
+});
+runningAppsList.addEventListener("submit", (event) => {
+  const form = event.target.closest("[data-app-opening-form]");
+  if (!form) return;
+  event.preventDefault();
+  saveAppOpeningUrl(form);
+});
+sshTunnelsButton.addEventListener("click", () => {
+  if (sshTunnelsView.hidden) openSshTunnels();
+  else closeSshTunnels();
+});
+document.querySelector("#ssh-tunnels-close-button").addEventListener("click", closeSshTunnels);
+document.querySelector("#ssh-tunnels-refresh-button").addEventListener("click", () => refreshSshTunnels());
+document.querySelector("#new-ssh-tunnel-button").addEventListener("click", () => openSshTunnelModal());
+sshTunnelsList.addEventListener("change", (event) => {
+  const toggle = event.target.closest("[data-tunnel-toggle]");
+  if (toggle) setSshTunnelEnabled(toggle.dataset.tunnelToggle, toggle.checked, toggle);
+});
+sshTunnelsList.addEventListener("click", (event) => {
+  const action = event.target.closest("[data-tunnel-action]")?.dataset.tunnelAction;
+  if (action === "new") return openSshTunnelModal();
+  const id = event.target.closest("[data-tunnel-id]")?.dataset.tunnelId;
+  const tunnel = sshTunnels.find((item) => item.id === id);
+  if (action === "edit" && tunnel) openSshTunnelModal(tunnel);
+  if (action === "delete" && tunnel) deleteSshTunnel(id);
 });
 document.querySelector("#repository-close-button").addEventListener("click", closeRepository);
 document.querySelector("#repository-refresh-button").addEventListener("click", refreshRepositoryView);
@@ -2003,6 +2531,38 @@ activityPanel.addEventListener("click", (event) => {
   if (https) return openPort(https, true);
   const copy = event.target.closest("[data-copy-url]")?.dataset.copyUrl;
   if (copy) copyText(copy, "Port URL copied.");
+});
+
+sshTunnelForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = document.querySelector("#save-ssh-tunnel-button");
+  const input = {
+    name: document.querySelector("#ssh-tunnel-name").value,
+    sshHost: document.querySelector("#ssh-tunnel-host").value,
+    sshPort: Number(document.querySelector("#ssh-tunnel-ssh-port").value),
+    username: document.querySelector("#ssh-tunnel-username").value,
+    localPort: Number(document.querySelector("#ssh-tunnel-local-port").value),
+    remoteHost: document.querySelector("#ssh-tunnel-remote-host").value,
+    remotePort: Number(document.querySelector("#ssh-tunnel-remote-port").value),
+    identityFile: document.querySelector("#ssh-tunnel-identity").value || null
+  };
+  button.disabled = true;
+  try {
+    if (editingSshTunnelId) {
+      await call("update_ssh_tunnel", { id: editingSshTunnelId, input });
+      showToast("Tunnel updated.");
+    } else {
+      await call("create_ssh_tunnel", { input });
+      showToast("Tunnel saved.");
+    }
+    sshTunnelDialog.close();
+    editingSshTunnelId = null;
+    await refreshSshTunnels({ quiet: true });
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 projectForm.addEventListener("submit", async (event) => {
@@ -2162,6 +2722,7 @@ grid.addEventListener("click", (event) => {
   if (action === "empty-window") return openWindowModal();
   const card = event.target.closest(".terminal-card");
   if (!card) return;
+  selectedWindowId = card.dataset.windowId;
   if (action === "copy") {
     const selection = terminals.get(card.dataset.windowId)?.terminal.getSelection();
     if (selection) copyText(selection, "Terminal selection copied.");
@@ -2251,17 +2812,49 @@ grid.addEventListener("pointerdown", (event) => {
 async function init() {
   try { config = await call("get_config"); }
   catch (error) { showToast(error.message, true); }
+  await refreshSshTunnels({ quiet: true });
   await refreshProjects({ quiet: true });
+  await refreshRunningApps({ quiet: true });
   pollStatuses();
   scheduleGitStatusPoll();
+  scheduleRunningAppsPoll();
 }
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     pollStatuses();
     refreshGitStatus({ quiet: true });
+    refreshRunningApps({ quiet: true });
   }
 });
+document.addEventListener("keydown", (event) => {
+  if (handleShortcutRecording(event)) return;
+  if (!event.key.startsWith("Arrow") || event.defaultPrevented || document.querySelector("dialog[open]")) return;
+  const editable = event.target instanceof Element
+    ? event.target.closest("input, select, textarea, [contenteditable='true']")
+    : null;
+  if (editable && !editable.closest(".xterm")) return;
+  const direction = event.key.slice(5).toLowerCase();
+  if (matchesShortcutBinding(event, shortcutBindings.projectSwitch)) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    switchProjectInDirection(direction);
+  } else if (matchesShortcutBinding(event, shortcutBindings.windowFocus)) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    focusWindowInDirection(direction);
+  }
+}, true);
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || event.defaultPrevented || document.querySelector("dialog[open]")) return;
+  if (!runningAppsView.hidden) closeRunningApps();
+  else if (!sshTunnelsView.hidden) closeSshTunnels();
+  else if (!repositoryBrowser.hidden) closeRepository();
+  else if (workspace.classList.contains("activity-open")) closeActivityPanel();
+  else return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}, true);
 document.addEventListener("keydown", (event) => {
   if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
   if (!["+", "=", "-", "_", "0"].includes(event.key)) return;
@@ -2281,6 +2874,8 @@ window.addEventListener("resize", () => {
 window.addEventListener("beforeunload", () => {
   clearTimeout(statusTimer);
   clearTimeout(gitStatusTimer);
+  clearTimeout(sshTunnelsTimer);
+  clearTimeout(runningAppsTimer);
   if (popoutWindowId && typeof tauriListen !== "function") {
     popoutChannel?.postMessage({ type: "closed", id: popoutWindowId });
   }
