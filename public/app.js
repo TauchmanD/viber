@@ -2221,6 +2221,15 @@ function applyMaximizedWindow(id) {
   requestAnimationFrame(() => terminals.forEach((entry) => entry.fitAddon.fit()));
 }
 
+function focusTerminalWindow(id) {
+  const entry = terminals.get(id);
+  if (!entry) return false;
+  selectedWindowId = id;
+  renderCompactNavigation();
+  entry.terminal.focus();
+  return true;
+}
+
 function focusWindowInDirection(direction) {
   if (grid.hidden) return;
   const cards = [...grid.querySelectorAll(".terminal-card[data-window-id]")]
@@ -2239,12 +2248,9 @@ function focusWindowInDirection(direction) {
   const focusedId = document.activeElement?.closest(".terminal-card")?.dataset.windowId;
   const currentId = focusedId || selectedWindowId || cards[0].id;
   const nextId = UiLayout.directionalNeighbor(cards, currentId, direction);
-  const entry = terminals.get(nextId);
-  if (!entry) return;
-  selectedWindowId = nextId;
+  if (!terminals.has(nextId)) return;
   if (compactMode || maximizedWindowId) applyMaximizedWindow(nextId);
-  renderCompactNavigation();
-  entry.terminal.focus();
+  focusTerminalWindow(nextId);
 }
 
 async function switchProjectInDirection(direction) {
@@ -2262,7 +2268,7 @@ async function switchProjectInDirection(direction) {
       || null;
     await render();
     await refreshGitStatus({ quiet: true });
-    terminals.get(selectedWindowId)?.terminal.focus();
+    focusTerminalWindow(selectedWindowId);
   } finally {
     projectSwitchInFlight = false;
   }
@@ -2499,18 +2505,21 @@ compactProjectList.addEventListener("click", async (event) => {
   if (!id || id === activeProjectId) return closeCompactMenu();
   activeProjectId = id;
   localStorage.setItem("agent-grid-project", id);
-  selectedWindowId = projects.find((project) => project.id === id)?.windows[0]?.id || null;
+  const project = projects.find((project) => project.id === id);
+  selectedWindowId = project?.windows.find((window) => !poppedOutWindowIds.has(window.id))?.id
+    || project?.windows[0]?.id
+    || null;
   closeCompactMenu();
   await render();
   await refreshGitStatus({ quiet: true });
+  focusTerminalWindow(selectedWindowId);
 });
 compactWindowList.addEventListener("click", (event) => {
   const id = event.target.closest("[data-compact-window]")?.dataset.compactWindow;
   if (!id) return;
-  selectedWindowId = id;
   closeCompactMenu();
   applyMaximizedWindow(id);
-  renderCompactNavigation();
+  focusTerminalWindow(id);
 });
 document.querySelectorAll(".dialog-close").forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
 document.querySelectorAll(".browse-button").forEach((button) => button.addEventListener("click", () => browseDirectory(button.dataset.browse)));
@@ -2605,8 +2614,7 @@ windowForm.addEventListener("submit", async (event) => {
     selectedWindowId = created.id;
     windowDialog.close();
     await refreshProjects({ quiet: true });
-    terminals.get(created.id)?.terminal.focus();
-    renderCompactNavigation();
+    focusTerminalWindow(created.id);
     showToast(windowKind === "agent" ? "Agent opened." : "Terminal opened.");
   } catch (error) { showToast(error.message, true); }
   finally { button.disabled = false; }
@@ -2619,8 +2627,13 @@ projectList.addEventListener("click", async (event) => {
   if (!id || id === activeProjectId) return;
   activeProjectId = id;
   localStorage.setItem("agent-grid-project", id);
+  const project = projects.find((project) => project.id === id);
+  selectedWindowId = project?.windows.find((window) => !poppedOutWindowIds.has(window.id))?.id
+    || project?.windows[0]?.id
+    || null;
   await render();
   await refreshGitStatus({ quiet: true });
+  focusTerminalWindow(selectedWindowId);
 });
 
 projectList.addEventListener("contextmenu", (event) => {
@@ -2713,7 +2726,7 @@ projectList.addEventListener("dragend", () => {
 windowList.addEventListener("click", (event) => {
   const id = event.target.closest("[data-scroll-window]")?.dataset.scrollWindow;
   if (!id) return;
-  selectedWindowId = id;
+  focusTerminalWindow(id);
   document.querySelector(`#window-${id}`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
 });
 
@@ -2738,6 +2751,12 @@ grid.addEventListener("click", (event) => {
   if (action === "maximize") toggleMaximize(card);
   if (action === "popout") popOutChat(card.dataset.windowId);
   if (action === "return-popout") returnPoppedOutChat(card.dataset.windowId);
+});
+
+grid.addEventListener("pointerover", (event) => {
+  const card = event.target.closest(".terminal-card[data-window-id]");
+  if (!card || card.contains(event.relatedTarget)) return;
+  focusTerminalWindow(card.dataset.windowId);
 });
 
 grid.addEventListener("dragstart", (event) => {
