@@ -12,6 +12,8 @@ A Linux Tauri desktop application for organizing persistent tmux terminals and c
 - The repository browser opens from the top bar or project context menu, expands the complete source tree including extensionless files, and filters README, Markdown, agent instructions, and other documentation into a dedicated Docs view. Markdown opens as a sanitized rendered preview with an optional source view.
 - The repository Git tab renders a color-coded graph across all branches and opens commit messages, parents, refs, statistics, and changed files without checking out the commit.
 - Each project row can launch its folder in the preferred editor. Visual Studio Code, Cursor, Zed, Sublime Text, IntelliJ IDEA, and a custom executable are configured under Settings.
+- The Tunnels tab defines local SSH port forwards, shows their full route, and starts or stops each tunnel without leaving the workspace.
+- The Apps tab counts live services, groups Docker Compose containers into one application, groups local listeners by Agent Grid project, and stores a default opening URL for every group.
 - Codex sessions retain explicit rollout-state detection and full-conversation handoff forks.
 - Every window runs in a persistent tmux session and survives closing the application.
 - Windows can be dragged, split, swapped, resized, maximized, automatically tiled, or popped into a separate native window.
@@ -20,6 +22,7 @@ A Linux Tauri desktop application for organizing persistent tmux terminals and c
 - Activity timelines retain prompts, process changes, ports, and handoffs for up to 30 days.
 - Listening TCP ports are attributed to their owning tmux pane and can be opened or copied from the UI.
 - Terminal font size is configured under Settings or with `Ctrl++`, `Ctrl+-`, `Ctrl+0`, and `Ctrl+mouse wheel`.
+- Keyboard navigation defaults to `Alt+Arrow` for spatial window focus and `Ctrl+Alt+Arrow` for project switching; both modifier combinations are configurable under Settings.
 - `Ctrl+Shift+C` copies terminal selections while `Ctrl+C` remains available for interrupts.
 - Shift+Tab is forwarded as back-tab, and Shift+Enter inserts a new line in agent chats.
 
@@ -38,18 +41,21 @@ Required to build and run:
 - Stable Rust toolchain, including Cargo
 - `tmux` available on `PATH`
 - `git` available on `PATH`
+- OpenSSH `ssh` available on `PATH`
 - [OMP](https://github.com/can1357/oh-my-pi) available as `omp` on `PATH`
 - Tauri v2 Linux system libraries
 
 OMP is the default and supported agent harness for this application. Project commands remain configurable, but the documented setup assumes OMP. Codex, Claude, OpenCode, and other interactive commands are optional alternatives. Git powers the sidebar branch controls and complete handoff repository snapshots.
 
+Docker is optional. When the `docker` CLI can reach a running daemon, the Apps tab discovers standalone containers and Compose projects from container metadata. Local services opened inside Agent Grid are detected without Docker.
+
 ### Debian or Ubuntu dependencies
 
-These packages follow the official [Tauri v2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/) and add Git and tmux:
+These packages follow the official [Tauri v2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/) and add Git, OpenSSH, and tmux:
 
 ```bash
 sudo apt update
-sudo apt install git tmux libwebkit2gtk-4.1-dev build-essential curl wget file \
+sudo apt install git openssh-client tmux libwebkit2gtk-4.1-dev build-essential curl wget file \
   libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 ```
 
@@ -57,11 +63,11 @@ sudo apt install git tmux libwebkit2gtk-4.1-dev build-essential curl wget file \
 
 ```bash
 sudo pacman -Syu
-sudo pacman -S --needed git tmux webkit2gtk-4.1 base-devel curl wget file \
+sudo pacman -S --needed git openssh tmux webkit2gtk-4.1 base-devel curl wget file \
   openssl appmenu-gtk-module libappindicator-gtk3 librsvg xdotool
 ```
 
-For other distributions, install the equivalent WebKitGTK 4.1 development package, compiler toolchain, OpenSSL development headers, app-indicator library, librsvg, Git, and tmux. Consult the current [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) when package names differ.
+For other distributions, install the equivalent WebKitGTK 4.1 development package, compiler toolchain, OpenSSL development headers, app-indicator library, librsvg, Git, OpenSSH, and tmux. Consult the current [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) when package names differ.
 
 ### Rust
 

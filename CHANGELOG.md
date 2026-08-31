@@ -6,9 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 
 ## [Unreleased]
 
+### Added
+
+- Top-bar SSH tunnel management with persistent route definitions, local-only port binding, SSH-agent or identity-file authentication, live process status, and per-tunnel on/off toggles.
+- Top-bar running-application inventory with live service counts, Docker Compose and local-project grouping, published-port shortcuts, and persistent per-group opening URLs.
+- Configurable arrow-key navigation for spatial terminal focus and previous/next project switching, with persistent bindings, conflict detection, and reset controls in Settings.
+- Escape-key navigation from Apps, Tunnels, Repository, and Activity views back to the terminal grid.
+
 ### Fixed
 
 - Fall back to software rendering automatically when no `/dev/dri` render node is present, so the app no longer hangs with an invisible window when a WSLg host's GPU passthrough (`dxgkrnl`) is stuck. Documented the underlying WSL glitch and the `wsl --shutdown` fix in the README.
+- OMP and Chromium helper listeners no longer appear as user applications or opening URLs.
 
 ## [0.2.0] - 2026-08-26
 
