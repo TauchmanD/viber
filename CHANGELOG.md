@@ -17,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 
 - Fall back to software rendering automatically when no `/dev/dri` render node is present, so the app no longer hangs with an invisible window when a WSLg host's GPU passthrough (`dxgkrnl`) is stuck. Documented the underlying WSL glitch and the `wsl --shutdown` fix in the README.
 - OMP and Chromium helper listeners no longer appear as user applications or opening URLs.
+- Newly created agent and terminal windows receive keyboard focus immediately.
 
 ## [0.2.0] - 2026-08-26
 

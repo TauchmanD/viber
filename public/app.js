@@ -2596,14 +2596,17 @@ windowForm.addEventListener("submit", async (event) => {
   const button = document.querySelector("#spawn-button");
   button.disabled = true;
   try {
-    await call("create_window", { projectId: project.id, input: {
+    const created = await call("create_window", { projectId: project.id, input: {
       name: document.querySelector("#window-name").value,
       cwd: document.querySelector("#window-cwd").value,
       command: windowKind === "agent" ? document.querySelector("#window-command").value : null,
       kind: windowKind
     }});
+    selectedWindowId = created.id;
     windowDialog.close();
     await refreshProjects({ quiet: true });
+    terminals.get(created.id)?.terminal.focus();
+    renderCompactNavigation();
     showToast(windowKind === "agent" ? "Agent opened." : "Terminal opened.");
   } catch (error) { showToast(error.message, true); }
   finally { button.disabled = false; }
