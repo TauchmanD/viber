@@ -12,6 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 - Top-bar running-application inventory with live service counts, Docker Compose and local-project grouping, published-port shortcuts, and persistent per-group opening URLs.
 - Configurable arrow-key navigation for spatial terminal focus and previous/next project switching, with persistent bindings, conflict detection, and reset controls in Settings.
 - Escape-key navigation from Apps, Tunnels, Repository, and Activity views back to the terminal grid.
+- Full remote workspaces through persisted OpenSSH Host profiles, including remote tmux terminals, Git operations, repository browsing, Docker and process discovery, automatic loopback port forwarding, connection tests, and VS Code/Cursor remote launch.
 
 ### Fixed
 

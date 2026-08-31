@@ -368,6 +368,20 @@ button { color: inherit; }
   text-align: left;
 }
 .project-icon { color: var(--accent); font: 14px var(--mono); }
+.project-icon.remote { color: #68a7e8; }
+.project-remote-badge {
+  flex: 0 1 auto;
+  max-width: 90px;
+  padding: 2px 5px;
+  overflow: hidden;
+  border: 1px solid rgba(104, 167, 232, 0.24);
+  border-radius: 4px;
+  background: rgba(104, 167, 232, 0.08);
+  color: #8fc2f4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 8px var(--mono);
+}
 .project-copy { min-width: 0; }
 .project-title { display: flex; min-width: 0; align-items: center; gap: 7px; }
 .project-name, .project-count { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1846,6 +1860,68 @@ button { color: inherit; }
 }
 
 .settings-modal { width: min(620px, calc(100vw - 32px)); }
+.settings-modal form {
+  max-height: min(820px, calc(100vh - 32px));
+  overflow-y: auto;
+}
+.ssh-profile-settings {
+  display: grid;
+  gap: 8px;
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.ssh-profile-settings-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 3px;
+}
+.ssh-profile-settings-heading > span { min-width: 0; }
+.ssh-profile-settings-heading strong,
+.ssh-profile-settings-heading small { display: block; }
+.ssh-profile-settings-heading strong { color: #bcc1c7; font-size: 12px; }
+.ssh-profile-settings-heading small { margin-top: 4px; color: #747b84; font-size: 10px; }
+.ssh-profile-settings-heading .button { flex: 0 0 auto; min-height: 29px; font-size: 10px; }
+.ssh-profile-list { display: grid; gap: 6px; }
+.ssh-profile-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto 28px;
+  align-items: center;
+  gap: 6px;
+  min-height: 48px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b0d11;
+}
+.ssh-profile-mark {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(104, 167, 232, 0.28);
+  border-radius: 6px;
+  background: rgba(104, 167, 232, 0.08);
+  color: #8fc2f4;
+  font: 12px var(--mono);
+}
+.ssh-profile-row > span:nth-child(2) { min-width: 0; }
+.ssh-profile-row strong,
+.ssh-profile-row small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ssh-profile-row strong { color: var(--text); font-size: 11px; }
+.ssh-profile-row small { margin-top: 3px; color: #6f7883; font: 9px var(--mono); }
+.ssh-profile-row .button { min-height: 27px; padding: 0 8px; font-size: 9px; }
+.ssh-profile-row .icon-button { min-width: 27px; width: 27px; height: 27px; }
+.ssh-profile-empty { margin: 0; padding: 12px; border: 1px dashed var(--line); border-radius: 7px; color: #747b84; text-align: center; font-size: 10px; }
+
 .shortcut-settings {
   display: grid;
   gap: 8px;

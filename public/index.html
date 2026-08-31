@@ -255,6 +255,13 @@
           <input id="project-name" name="name" value="Project" maxlength="60" required autocomplete="off">
         </label>
         <label>
+          <span>Runs on</span>
+          <select id="project-ssh-profile" name="sshProfileId">
+            <option value="">Local machine</option>
+          </select>
+          <small id="project-location-help">Commands, tmux, Git, and files use this machine.</small>
+        </label>
+        <label>
           <span>Project directory</span>
           <span class="path-input">
             <input id="project-cwd" name="cwd" required spellcheck="false">
@@ -362,6 +369,28 @@
       </form>
     </dialog>
 
+    <dialog id="ssh-profile-dialog" class="modal">
+      <form id="ssh-profile-form" method="dialog">
+        <div class="modal-header">
+          <div><p id="ssh-profile-dialog-eyebrow" class="eyebrow">Remote development</p><h2 id="ssh-profile-dialog-title">Add SSH connection</h2></div>
+          <button type="button" class="icon-button dialog-close" aria-label="Close">×</button>
+        </div>
+        <label>
+          <span>Name</span>
+          <input id="ssh-profile-name" name="name" maxlength="60" placeholder="Development server" required autocomplete="off">
+        </label>
+        <label>
+          <span>SSH Host alias</span>
+          <input id="ssh-profile-host" name="host" placeholder="dev-server" required spellcheck="false">
+          <small>Uses the matching Host entry, keys, agent, and ProxyJump settings from ~/.ssh/config.</small>
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="button ghost dialog-close">Cancel</button>
+          <button type="submit" id="save-ssh-profile-button" class="button primary">Save connection</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog id="settings-dialog" class="modal settings-modal">
       <form method="dialog">
         <div class="modal-header">
@@ -386,6 +415,13 @@
           <input id="preferred-editor-custom" type="text" placeholder="/path/to/editor" spellcheck="false" hidden>
           <small>Projects open as folders. Custom values must be an executable name or absolute path, without arguments.</small>
         </label>
+        <section class="ssh-profile-settings" aria-labelledby="ssh-profile-settings-title">
+          <div class="ssh-profile-settings-heading">
+            <span><strong id="ssh-profile-settings-title">SSH connections</strong><small>Remote workspaces use standard OpenSSH Host profiles.</small></span>
+            <button id="new-ssh-profile-button" type="button" class="button ghost">Add connection</button>
+          </div>
+          <div id="ssh-profile-list" class="ssh-profile-list"></div>
+        </section>
         <section class="shortcut-settings" aria-labelledby="shortcut-settings-title">
           <div class="shortcut-settings-heading">
             <strong id="shortcut-settings-title">Keyboard navigation</strong>

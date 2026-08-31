@@ -5,6 +5,7 @@ A Linux Tauri desktop application for organizing persistent tmux terminals and c
 ## Features
 
 - Projects group related agent and terminal windows under a default directory and command.
+- Projects can run locally or as full remote workspaces through an OpenSSH Host profile; remote tmux, commands, Git, repository files, Docker services, and listening ports stay on that host.
 - Right-click a project name to edit its settings; drag project rows to persist a custom order.
 - Project status squares show one color-coded state per open window: working, ready, needs input, attention, exited, or stopped.
 - OMP is the default coding-agent command. OMP status is read from its terminal breadcrumb and structured session log instead of inferred from terminal redraws.
@@ -158,6 +159,30 @@ omp update
 ```
 
 The upstream installation and release documentation is maintained at [omp.sh](https://omp.sh) and [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi).
+
+## Remote development
+
+Remote workspaces use the system OpenSSH client and existing `Host` entries from `~/.ssh/config`. Agent Grid does not store passwords or private keys.
+
+1. Define and verify the host outside Agent Grid:
+
+   ```sshconfig
+   Host development
+     HostName dev.example.com
+     User developer
+     IdentityFile ~/.ssh/id_ed25519
+     # ProxyJump bastion
+   ```
+
+2. Open **Settings → SSH connections**, add `development` as the Host alias, and use **Test**.
+3. Create a project and choose that connection under **Runs on**.
+4. Enter an absolute directory from the remote host, for example `/home/developer/projects/api`.
+
+The remote host requires `tmux` and Git. OMP and other agent commands must also be installed remotely when used by the project. Docker is optional.
+
+Terminal windows attach to persistent tmux sessions through `ssh -tt`. Git status, branch operations, history, repository browsing, file previews, Docker Compose groups, and process-owned listening ports are queried over SSH. Published and detected remote ports receive temporary loopback forwards, which are removed when Agent Grid closes.
+
+Remote editor launch currently supports Visual Studio Code and Cursor through their `ssh-remote+<Host>` targets. Other configured editors continue to work for local projects only. Structured OMP breadcrumb state is currently local-only; remote OMP windows use tmux process and activity state.
 
 ## Installation from source
 

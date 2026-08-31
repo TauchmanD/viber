@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Read, Seek, SeekFrom, Write},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{Ipv4Addr, Ipv6Addr, TcpListener},
     path::{Path, PathBuf},
     process::{Child as ProcessChild, Command, Stdio},
     sync::Mutex,
@@ -70,6 +70,8 @@ struct StoredWindow {
     created_at: String,
     #[serde(default)]
     timeline: Vec<TimelineEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_profile_id: Option<String>,
 }
 
 fn default_command() -> String {
@@ -85,6 +87,8 @@ struct Project {
     #[serde(default = "default_command")]
     default_command: String,
     created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_profile_id: Option<String>,
     #[serde(default, alias = "agents")]
     windows: Vec<StoredWindow>,
 }
@@ -105,6 +109,15 @@ struct SshTunnel {
     created_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshProfile {
+    id: String,
+    name: String,
+    host: String,
+    created_at: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoreData {
@@ -116,10 +129,12 @@ struct StoreData {
     ssh_tunnels: Vec<SshTunnel>,
     #[serde(default)]
     app_opening_urls: BTreeMap<String, String>,
+    #[serde(default)]
+    ssh_profiles: Vec<SshProfile>,
 }
 
 fn store_version() -> u32 {
-    7
+    8
 }
 
 struct Store {
@@ -146,6 +161,7 @@ impl Store {
                 projects: Vec::new(),
                 ssh_tunnels: Vec::new(),
                 app_opening_urls: BTreeMap::new(),
+                ssh_profiles: Vec::new(),
             }
         };
         data.version = store_version();
@@ -153,6 +169,7 @@ impl Store {
         store.save()?;
         Ok(store)
     }
+
 
     fn save(&self) -> Result<(), String> {
         let temporary = self.path.with_extension("json.tmp");
@@ -169,6 +186,20 @@ impl Store {
             .flat_map(|project| &project.windows)
             .find(|window| window.id == id)
     }
+}
+fn execution_target(data: &StoreData, profile_id: Option<&str>) -> Result<ExecutionTarget, String> {
+    let Some(profile_id) = profile_id else {
+        return Ok(ExecutionTarget::Local);
+    };
+    let profile = data
+        .ssh_profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or("SSH profile not found.")?;
+    Ok(ExecutionTarget::Ssh {
+        profile_id: profile.id.clone(),
+        host: profile.host.clone(),
+    })
 }
 
 fn migrate_store(raw: &str) -> Result<StoreData, String> {
@@ -199,6 +230,8 @@ fn migrate_store(raw: &str) -> Result<StoreData, String> {
             cwd: windows[0].cwd.clone(),
             default_command: default_command(),
             created_at: timestamp(),
+            ssh_profile_id: None,
+
             windows,
         }]
     };
@@ -207,6 +240,7 @@ fn migrate_store(raw: &str) -> Result<StoreData, String> {
         projects,
         ssh_tunnels: Vec::new(),
         app_opening_urls: BTreeMap::new(),
+        ssh_profiles: Vec::new(),
     })
 }
 
@@ -214,6 +248,10 @@ struct PtyConnection {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
+}
+struct RemoteForward {
+    child: ProcessChild,
+    local_port: u16,
 }
 
 struct RuntimeState {
@@ -224,6 +262,7 @@ struct RuntimeState {
     omp_states: Mutex<HashMap<PathBuf, (u64, Option<String>)>>,
     compact_window: Mutex<Option<(i32, i32, u32, u32)>>,
     ssh_tunnel_processes: Mutex<HashMap<String, ProcessChild>>,
+    remote_forwards: Mutex<HashMap<String, RemoteForward>>,
     app_data_dir: PathBuf,
 }
 
@@ -233,6 +272,7 @@ struct ProjectInput {
     name: String,
     cwd: String,
     default_command: String,
+    ssh_profile_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -257,6 +297,13 @@ struct SshTunnelInput {
     identity_file: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SshProfileInput {
+    name: String,
+    host: String,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WindowView {
@@ -272,6 +319,8 @@ struct WindowView {
     last_activity_at: Option<u64>,
     activity_state: String,
     ports: Vec<PortView>,
+    ssh_profile_id: Option<String>,
+    remote: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -282,6 +331,9 @@ struct ProjectView {
     cwd: String,
     default_command: String,
     created_at: String,
+    ssh_profile_id: Option<String>,
+    ssh_profile_name: Option<String>,
+    remote: bool,
     windows: Vec<WindowView>,
 }
 
@@ -306,6 +358,10 @@ struct SshTunnelView {
 struct RunningAppPortView {
     url: String,
     label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_profile_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -768,83 +824,196 @@ fn read_repository_path(root: &Path, relative: &str) -> Result<RepositoryFileVie
     })
 }
 
-fn session_exists(session_name: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", session_name])
-        .output()
-        .is_ok_and(|output| output.status.success())
+#[derive(Clone, Debug, PartialEq)]
+enum ExecutionTarget {
+    Local,
+    Ssh { profile_id: String, host: String },
 }
 
-fn kill_session(session_name: &str) {
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", session_name])
-        .output();
+fn remote_shell_command(program: &str, args: &[&str]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().copied())
+        .map(|value| format!("'{}'", value.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-fn configure_session(session_name: &str) -> Result<(), String> {
-    let mouse = Command::new("tmux")
-        // xterm owns drag selection. Wheel events enter tmux copy mode through
-        // an explicit command, so tmux mouse reporting must remain disabled.
-        .args(["set-option", "-t", session_name, "mouse", "off"])
-        .status()
+fn target_output(
+    target: &ExecutionTarget,
+    program: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    let mut command = match target {
+        ExecutionTarget::Local => {
+            let mut command = Command::new(program);
+            command.args(args);
+            command
+        }
+        ExecutionTarget::Ssh { host, .. } => {
+            let mut command = Command::new("ssh");
+            command.args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-T",
+                host,
+                "--",
+                &remote_shell_command(program, args),
+            ]);
+            command
+        }
+    };
+    command.output().map_err(|error| match target {
+        ExecutionTarget::Local => format!("Could not run {program}: {error}"),
+        ExecutionTarget::Ssh { host, .. } => format!("Could not run {program} on {host}: {error}"),
+    })
+}
+
+fn target_success(target: &ExecutionTarget, program: &str, args: &[&str]) -> bool {
+    target_output(target, program, args).is_ok_and(|output| output.status.success())
+}
+
+fn write_remote_text(
+    target: &ExecutionTarget,
+    path: &str,
+    contents: &str,
+) -> Result<(), String> {
+    let ExecutionTarget::Ssh { host, .. } = target else {
+        return Err("Remote target required.".into());
+    };
+    let script = format!(
+        "umask 077 && cat > {}",
+        format!("'{}'", path.replace('\'', "'\"'\"'"))
+    );
+    let mut child = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-T", host, "--", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not upload remote handoff: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("Could not open SSH upload stream.")?
+        .write_all(contents.as_bytes())
         .map_err(|error| error.to_string())?;
-    let history = Command::new("tmux")
-        .args([
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Could not finish remote handoff upload: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+fn target_checked(
+    target: &ExecutionTarget,
+    program: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    let output = target_output(target, program, args)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("{program} failed with {}.", output.status)
+        });
+    }
+    Ok(strip_control_sequences(&String::from_utf8_lossy(&output.stdout))
+        .trim()
+        .to_owned())
+}
+
+fn session_exists_on(target: &ExecutionTarget, session_name: &str) -> bool {
+    target_success(target, "tmux", &["has-session", "-t", session_name])
+}
+
+fn session_exists(session_name: &str) -> bool {
+    session_exists_on(&ExecutionTarget::Local, session_name)
+}
+
+fn kill_session_on(target: &ExecutionTarget, session_name: &str) {
+    let _ = target_output(target, "tmux", &["kill-session", "-t", session_name]);
+}
+
+#[cfg(test)]
+fn kill_session(session_name: &str) {
+    kill_session_on(&ExecutionTarget::Local, session_name);
+}
+
+fn configure_session_on(target: &ExecutionTarget, session_name: &str) -> Result<(), String> {
+    let mouse = target_success(
+        target,
+        "tmux",
+        &["set-option", "-t", session_name, "mouse", "off"],
+    );
+    let history_target = format!("{session_name}:0");
+    let history = target_success(
+        target,
+        "tmux",
+        &[
             "set-option",
             "-w",
             "-t",
-            &format!("{session_name}:0"),
+            &history_target,
             "history-limit",
             "5000",
-        ])
-        .status()
-        .map_err(|error| error.to_string())?;
-    if mouse.success() && history.success() {
+        ],
+    );
+    if mouse && history {
         Ok(())
     } else {
-        Err("tmux could not configure mouse handling for the terminal session.".into())
+        Err("tmux could not configure the terminal session.".into())
     }
 }
 
-fn start_session(window: &StoredWindow) -> Result<(), String> {
-    if session_exists(&window.session_name) {
-        return configure_session(&window.session_name);
+
+fn start_session_on(target: &ExecutionTarget, window: &StoredWindow) -> Result<(), String> {
+    if session_exists_on(target, &window.session_name) {
+        return configure_session_on(target, &window.session_name);
     }
-    let status = Command::new("tmux")
-        .args([
+    if !target_success(
+        target,
+        "tmux",
+        &[
             "new-session",
             "-d",
             "-s",
             &window.session_name,
             "-c",
             &window.cwd,
-        ])
-        .status()
-        .map_err(|error| error.to_string())?;
-    if !status.success() {
+        ],
+    ) {
         return Err("tmux could not create the terminal session.".into());
     }
 
-    let target = format!("{}:0.0", window.session_name);
-    let _ = Command::new("tmux")
-        .args([
-            "rename-window",
-            "-t",
-            &format!("{}:0", window.session_name),
-            &window.name,
-        ])
-        .status();
-    let _ = Command::new("tmux")
-        .args([
+    let target_pane = format!("{}:0.0", window.session_name);
+    let target_window = format!("{}:0", window.session_name);
+    let _ = target_output(
+        target,
+        "tmux",
+        &["rename-window", "-t", &target_window, &window.name],
+    );
+    let _ = target_output(
+        target,
+        "tmux",
+        &[
             "set-option",
             "-t",
             &window.session_name,
             "@agent-grid-id",
             &window.id,
-        ])
-        .status();
-    if let Err(error) = configure_session(&window.session_name) {
-        kill_session(&window.session_name);
+        ],
+    );
+    if let Err(error) = configure_session_on(target, &window.session_name) {
+        kill_session_on(target, &window.session_name);
         return Err(error);
     }
     if matches!(window.kind, WindowKind::Agent) {
@@ -853,21 +1022,176 @@ fn start_session(window: &StoredWindow) -> Result<(), String> {
             .as_ref()
             .filter(|command| !command.trim().is_empty())
         {
-            let typed = Command::new("tmux")
-                .args(["send-keys", "-t", &target, "-l", command])
-                .status();
-            let entered = Command::new("tmux")
-                .args(["send-keys", "-t", &target, "Enter"])
-                .status();
-            if !typed.is_ok_and(|status| status.success())
-                || !entered.is_ok_and(|status| status.success())
-            {
-                kill_session(&window.session_name);
+            let typed =
+                target_success(target, "tmux", &["send-keys", "-t", &target_pane, "-l", command]);
+            let entered =
+                target_success(target, "tmux", &["send-keys", "-t", &target_pane, "Enter"]);
+            if !typed || !entered {
+                kill_session_on(target, &window.session_name);
                 return Err("tmux could not start the agent command.".into());
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn start_session(window: &StoredWindow) -> Result<(), String> {
+    start_session_on(&ExecutionTarget::Local, window)
+}
+
+fn valid_repository_relative_path(relative: &str) -> bool {
+    let path = Path::new(relative);
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn repository_view_from_paths(paths: impl IntoIterator<Item = String>) -> RepositoryView {
+    let mut files = HashSet::<PathBuf>::new();
+    let mut directories = HashSet::<PathBuf>::new();
+    for raw in paths {
+        let path = PathBuf::from(raw.trim_start_matches("./"));
+        if path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(ignored_repository_directory)
+            })
+        {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            for ancestor in parent
+                .ancestors()
+                .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            {
+                directories.insert(ancestor.to_path_buf());
+            }
+        }
+        files.insert(path);
+    }
+    let mut entries = directories
+        .into_iter()
+        .map(|path| RepositoryEntry {
+            name: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            path: path.to_string_lossy().replace('\\', "/"),
+            is_directory: true,
+            depth: path.components().count().saturating_sub(1) as u16,
+            documentation: false,
+        })
+        .chain(files.into_iter().map(|path| RepositoryEntry {
+            name: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            path: path.to_string_lossy().replace('\\', "/"),
+            is_directory: false,
+            depth: path.components().count().saturating_sub(1) as u16,
+            documentation: documentation_path(&path),
+        }))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let truncated = entries.len() > REPOSITORY_ENTRY_LIMIT;
+    entries.truncate(REPOSITORY_ENTRY_LIMIT);
+    RepositoryView { entries, truncated }
+}
+
+fn list_repository_on(target: &ExecutionTarget, root: &str) -> Result<RepositoryView, String> {
+    if matches!(target, ExecutionTarget::Local) {
+        return list_repository_path(Path::new(root));
+    }
+    let git = target_output(
+        target,
+        "git",
+        &[
+            "-C",
+            root,
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?;
+    let (bytes, strip_root) = if git.status.success() {
+        (git.stdout, false)
+    } else {
+        let find = target_output(target, "find", &[root, "-type", "f", "-print0"])?;
+        if !find.status.success() {
+            return Err(String::from_utf8_lossy(&find.stderr).trim().to_owned());
+        }
+        (find.stdout, true)
+    };
+    let root_prefix = format!("{}/", root.trim_end_matches('/'));
+    let paths = bytes
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .map(|path| {
+            if strip_root {
+                path.strip_prefix(&root_prefix).unwrap_or(&path).to_owned()
+            } else {
+                path
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(repository_view_from_paths(paths))
+}
+
+fn read_repository_on(
+    target: &ExecutionTarget,
+    root: &str,
+    relative: &str,
+) -> Result<RepositoryFileView, String> {
+    if matches!(target, ExecutionTarget::Local) {
+        return read_repository_path(Path::new(root), relative);
+    }
+    if !valid_repository_relative_path(relative) {
+        return Err("Invalid repository path.".into());
+    }
+    let canonical_root = target_checked(target, "realpath", &["-e", root])?;
+    let joined = format!("{}/{}", canonical_root.trim_end_matches('/'), relative);
+    let target_path = target_checked(target, "realpath", &["-e", &joined])?;
+    let prefix = format!("{}/", canonical_root.trim_end_matches('/'));
+    if !target_path.starts_with(&prefix) || !target_success(target, "test", &["-f", &target_path]) {
+        return Err("File is outside the project or is not available.".into());
+    }
+    let size = target_checked(target, "stat", &["-c", "%s", &target_path])?
+        .parse::<u64>()
+        .map_err(|_| "Could not inspect remote file size.".to_owned())?;
+    if size > REPOSITORY_FILE_LIMIT {
+        return Err(format!(
+            "File is larger than the {} MiB preview limit.",
+            REPOSITORY_FILE_LIMIT / (1024 * 1024)
+        ));
+    }
+    let output = target_output(target, "cat", &["--", &target_path])?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    if output.stdout.contains(&0) {
+        return Err("Binary files cannot be previewed.".into());
+    }
+    let content = String::from_utf8(output.stdout)
+        .map_err(|_| "File is not valid UTF-8 and cannot be previewed.")?;
+    Ok(RepositoryFileView {
+        path: relative.replace('\\', "/"),
+        content,
+        size,
+        documentation: documentation_path(Path::new(relative)),
+    })
 }
 
 fn shell_command(command: Option<&str>) -> bool {
@@ -1387,9 +1711,171 @@ fn collect_runtime_snapshots(
     snapshots
 }
 
+fn parse_remote_process_table(output: &str) -> HashMap<u32, Vec<u32>> {
+    let mut children = HashMap::<u32, Vec<u32>>::new();
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(parent)) = (
+            fields.next().and_then(|value| value.parse::<u32>().ok()),
+            fields.next().and_then(|value| value.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        children.entry(parent).or_default().push(pid);
+    }
+    children
+}
+
+fn remote_process_tree(root: u32, children: &HashMap<u32, Vec<u32>>) -> HashSet<u32> {
+    let mut found = HashSet::from([root]);
+    let mut pending = vec![root];
+    while let Some(parent) = pending.pop() {
+        for child in children.get(&parent).into_iter().flatten() {
+            if found.insert(*child) {
+                pending.push(*child);
+            }
+        }
+    }
+    found
+}
+
+fn parse_remote_listeners(output: &str) -> Vec<(u16, String, u32, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let endpoint = *fields.get(3)?;
+            let (address, port) = endpoint.rsplit_once(':')?;
+            let port = port.parse::<u16>().ok()?;
+            let pid_start = line.find("pid=")? + 4;
+            let pid_end = line[pid_start..]
+                .find(|character: char| !character.is_ascii_digit())
+                .map(|offset| pid_start + offset)
+                .unwrap_or(line.len());
+            let pid = line[pid_start..pid_end].parse::<u32>().ok()?;
+            let process = line
+                .split_once("((\"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(name, _)| name.to_owned())
+                .unwrap_or_default();
+            let address = address
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_matches('*');
+            let address = if address.is_empty() {
+                "0.0.0.0".into()
+            } else {
+                address.to_owned()
+            };
+            Some((port, address, pid, process))
+        })
+        .collect()
+}
+
+fn collect_remote_runtime_snapshots(
+    state: &RuntimeState,
+    profile: &SshProfile,
+    target: &ExecutionTarget,
+    windows: &[StoredWindow],
+) -> HashMap<String, RuntimeSnapshot> {
+    let by_session: HashMap<_, _> = windows
+        .iter()
+        .map(|window| (window.session_name.as_str(), window))
+        .collect();
+    let mut snapshots: HashMap<String, RuntimeSnapshot> = windows
+        .iter()
+        .map(|window| (window.id.clone(), RuntimeSnapshot::default()))
+        .collect();
+    let Ok(output) = target_output(
+        target,
+        "tmux",
+        &[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_pid}\t#{pane_current_command}\t#{window_activity}",
+        ],
+    ) else {
+        return snapshots;
+    };
+    if !output.status.success() {
+        return snapshots;
+    }
+    let process_table = target_output(
+        target,
+        "ps",
+        &["-eo", "pid=,ppid=,comm="],
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| parse_remote_process_table(&String::from_utf8_lossy(&output.stdout)));
+    let listeners = target_output(target, "ss", &["-ltnpH"])
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_remote_listeners(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.splitn(4, '\t');
+        let (Some(session), pane_pid, command, activity) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(window) = by_session.get(session) else {
+            continue;
+        };
+        let pane_pid = pane_pid.and_then(|value| value.parse::<u32>().ok());
+        let cohort = process_table
+            .as_ref()
+            .zip(pane_pid)
+            .map(|(children, root)| remote_process_tree(root, children))
+            .unwrap_or_default();
+        let ports = listeners
+            .iter()
+            .filter(|(_, _, pid, process)| cohort.contains(pid) && !internal_app_process(process))
+            .filter_map(|(port, address, pid, process)| {
+                let local_port = ensure_remote_forward(state, profile, *port).ok()?;
+                let scheme = if matches!(*port, 443 | 8443 | 9443) {
+                    "https"
+                } else {
+                    "http"
+                };
+                Some(PortView {
+                    port: *port,
+                    address: address.clone(),
+                    url: format!("{scheme}://127.0.0.1:{local_port}"),
+                    pid: *pid,
+                    process: process.clone(),
+                })
+            })
+            .collect();
+        let mut snapshot = RuntimeSnapshot {
+            running: true,
+            current_command: command
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            last_activity_at: activity
+                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(|seconds| seconds.checked_mul(1_000)),
+            ports,
+            ..RuntimeSnapshot::default()
+        };
+        snapshot.activity_state = activity_state(window, &snapshot);
+        snapshots.insert(window.id.clone(), snapshot);
+    }
+    for window in windows {
+        if let Some(snapshot) = snapshots.get_mut(&window.id) {
+            if snapshot.activity_state.is_empty() {
+                snapshot.activity_state = activity_state(window, snapshot);
+            }
+        }
+    }
+    snapshots
+}
+
 fn window_view(window: &StoredWindow, snapshot: Option<&RuntimeSnapshot>) -> WindowView {
     let fallback = RuntimeSnapshot {
-        running: session_exists(&window.session_name),
+        running: window.ssh_profile_id.is_none() && session_exists(&window.session_name),
         activity_state: String::new(),
         ..RuntimeSnapshot::default()
     };
@@ -1417,6 +1903,8 @@ fn window_view(window: &StoredWindow, snapshot: Option<&RuntimeSnapshot>) -> Win
         last_activity_at: snapshot.last_activity_at,
         activity_state,
         ports: snapshot.ports.clone(),
+        ssh_profile_id: window.ssh_profile_id.clone(),
+        remote: window.ssh_profile_id.is_some(),
     }
 }
 
@@ -1507,17 +1995,13 @@ fn clean_submission_text(input: &str) -> String {
     cleaned[prefix..].trim().to_owned()
 }
 
-fn capture_pane(window: &StoredWindow) -> String {
-    let output = Command::new("tmux")
-        .args([
-            "capture-pane",
-            "-p",
-            "-S",
-            "-200",
-            "-t",
-            &format!("{}:0.0", window.session_name),
-        ])
-        .output();
+fn capture_pane_on(target: &ExecutionTarget, window: &StoredWindow) -> String {
+    let pane = format!("{}:0.0", window.session_name);
+    let output = target_output(
+        target,
+        "tmux",
+        &["capture-pane", "-p", "-S", "-200", "-t", &pane],
+    );
     let Ok(output) = output else {
         return String::new();
     };
@@ -1529,43 +2013,37 @@ fn capture_pane(window: &StoredWindow) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+
+fn git_checked_on(
+    target: &ExecutionTarget,
+    cwd: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    let mut command_args = vec!["-C", cwd];
+    command_args.extend_from_slice(args);
+    target_checked(target, "git", &command_args)
+}
+
+#[cfg(test)]
 fn git_checked(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|error| format!("Could not run git: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        return Err(if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("git {} failed.", args.join(" "))
-        });
-    }
-    Ok(
-        strip_control_sequences(&String::from_utf8_lossy(&output.stdout))
-            .trim()
-            .to_owned(),
-    )
+    git_checked_on(&ExecutionTarget::Local, &cwd.to_string_lossy(), args)
 }
 
-fn git_output(cwd: &str, args: &[&str]) -> String {
-    git_checked(Path::new(cwd), args).unwrap_or_default()
+fn git_output_on(target: &ExecutionTarget, cwd: &str, args: &[&str]) -> String {
+    git_checked_on(target, cwd, args).unwrap_or_default()
 }
 
-fn git_status_for_path(cwd: &Path) -> Result<GitStatusView, String> {
-    let probe = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map_err(|error| format!("Could not run git: {error}"))?;
+
+fn git_status_on(target: &ExecutionTarget, cwd: &str) -> Result<GitStatusView, String> {
+    let probe = target_output(
+        target,
+        "git",
+        &["-C", cwd, "rev-parse", "--is-inside-work-tree"],
+    )?;
     if !probe.status.success() {
+        if matches!(target, ExecutionTarget::Ssh { .. }) && probe.status.code() == Some(255) {
+            return Err(String::from_utf8_lossy(&probe.stderr).trim().to_owned());
+        }
         return Ok(GitStatusView {
             available: false,
             branch: None,
@@ -1579,15 +2057,20 @@ fn git_status_for_path(cwd: &Path) -> Result<GitStatusView, String> {
         });
     }
 
-    let branch = git_checked(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .ok()
-        .filter(|value| !value.is_empty());
+    let branch = git_checked_on(
+        target,
+        cwd,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()
+    .filter(|value| !value.is_empty());
     let head = branch.clone().unwrap_or_else(|| {
-        git_checked(cwd, &["rev-parse", "--short", "HEAD"])
+        git_checked_on(target, cwd, &["rev-parse", "--short", "HEAD"])
             .map(|value| format!("detached@{value}"))
             .unwrap_or_else(|_| "Detached HEAD".into())
     });
-    let branches = git_checked(
+    let branches = git_checked_on(
+        target,
         cwd,
         &[
             "for-each-ref",
@@ -1599,9 +2082,14 @@ fn git_status_for_path(cwd: &Path) -> Result<GitStatusView, String> {
     .lines()
     .map(ToOwned::to_owned)
     .collect();
-    let dirty =
-        !git_checked(cwd, &["status", "--porcelain", "--untracked-files=normal"])?.is_empty();
-    let upstream = git_checked(
+    let dirty = !git_checked_on(
+        target,
+        cwd,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?
+    .is_empty();
+    let upstream = git_checked_on(
+        target,
         cwd,
         &[
             "rev-parse",
@@ -1615,7 +2103,8 @@ fn git_status_for_path(cwd: &Path) -> Result<GitStatusView, String> {
     let (ahead, behind) = upstream
         .as_ref()
         .and_then(|_| {
-            git_checked(
+            git_checked_on(
+                target,
                 cwd,
                 &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
             )
@@ -1641,32 +2130,51 @@ fn git_status_for_path(cwd: &Path) -> Result<GitStatusView, String> {
     })
 }
 
-fn switch_git_branch_for_path(cwd: &Path, branch: &str) -> Result<GitStatusView, String> {
-    let status = git_status_for_path(cwd)?;
+#[cfg(test)]
+fn git_status_for_path(cwd: &Path) -> Result<GitStatusView, String> {
+    git_status_on(&ExecutionTarget::Local, &cwd.to_string_lossy())
+}
+
+fn switch_git_branch_on(
+    target: &ExecutionTarget,
+    cwd: &str,
+    branch: &str,
+) -> Result<GitStatusView, String> {
+    let status = git_status_on(target, cwd)?;
     if !status.available {
         return Err("Project is not a Git repository.".into());
     }
     if !status.branches.iter().any(|candidate| candidate == branch) {
         return Err("Unknown local branch.".into());
     }
-    git_checked(cwd, &["switch", "--", branch])?;
-    git_status_for_path(cwd)
+    git_checked_on(target, cwd, &["switch", "--", branch])?;
+    git_status_on(target, cwd)
 }
 
-fn pull_git_for_path(cwd: &Path) -> Result<GitStatusView, String> {
-    let status = git_status_for_path(cwd)?;
+#[cfg(test)]
+fn switch_git_branch_for_path(cwd: &Path, branch: &str) -> Result<GitStatusView, String> {
+    switch_git_branch_on(&ExecutionTarget::Local, &cwd.to_string_lossy(), branch)
+}
+
+fn pull_git_on(target: &ExecutionTarget, cwd: &str) -> Result<GitStatusView, String> {
+    let status = git_status_on(target, cwd)?;
     if !status.available {
         return Err("Project is not a Git repository.".into());
     }
     if !status.has_upstream {
         return Err("Current branch has no upstream branch.".into());
     }
-    git_checked(cwd, &["pull", "--ff-only"])?;
-    git_status_for_path(cwd)
+    git_checked_on(target, cwd, &["pull", "--ff-only"])?;
+    git_status_on(target, cwd)
 }
 
-fn push_git_for_path(cwd: &Path) -> Result<GitStatusView, String> {
-    let status = git_status_for_path(cwd)?;
+#[cfg(test)]
+fn pull_git_for_path(cwd: &Path) -> Result<GitStatusView, String> {
+    pull_git_on(&ExecutionTarget::Local, &cwd.to_string_lossy())
+}
+
+fn push_git_on(target: &ExecutionTarget, cwd: &str) -> Result<GitStatusView, String> {
+    let status = git_status_on(target, cwd)?;
     if !status.available {
         return Err("Project is not a Git repository.".into());
     }
@@ -1675,19 +2183,29 @@ fn push_git_for_path(cwd: &Path) -> Result<GitStatusView, String> {
         .as_deref()
         .ok_or("Cannot push a detached HEAD.")?;
     if status.has_upstream {
-        git_checked(cwd, &["push"])?;
+        git_checked_on(target, cwd, &["push"])?;
     } else {
-        let remotes = git_checked(cwd, &["remote"])?;
+        let remotes = git_checked_on(target, cwd, &["remote"])?;
         if !remotes.lines().any(|remote| remote == "origin") {
             return Err("Current branch has no upstream and remote 'origin' is missing.".into());
         }
-        git_checked(cwd, &["push", "--set-upstream", "origin", branch])?;
+        git_checked_on(target, cwd, &["push", "--set-upstream", "origin", branch])?;
     }
-    git_status_for_path(cwd)
+    git_status_on(target, cwd)
 }
 
-fn git_refs_for_commit(cwd: &Path, hash: &str) -> Result<Vec<String>, String> {
-    Ok(git_checked(
+#[cfg(test)]
+fn push_git_for_path(cwd: &Path) -> Result<GitStatusView, String> {
+    push_git_on(&ExecutionTarget::Local, &cwd.to_string_lossy())
+}
+
+fn git_refs_for_commit_on(
+    target: &ExecutionTarget,
+    cwd: &str,
+    hash: &str,
+) -> Result<Vec<String>, String> {
+    Ok(git_checked_on(
+        target,
         cwd,
         &[
             "for-each-ref",
@@ -1740,12 +2258,13 @@ fn parse_git_graph_output(output: &str) -> GitGraphView {
     GitGraphView { commits, truncated }
 }
 
-fn git_graph_for_path(cwd: &Path) -> Result<GitGraphView, String> {
-    if !git_status_for_path(cwd)?.available {
+fn git_graph_on(target: &ExecutionTarget, cwd: &str) -> Result<GitGraphView, String> {
+    if !git_status_on(target, cwd)?.available {
         return Err("Project is not a Git repository.".into());
     }
     let limit = format!("--max-count={}", GIT_GRAPH_LIMIT + 1);
-    let output = git_checked(
+    let output = git_checked_on(
+        target,
         cwd,
         &[
             "log",
@@ -1759,11 +2278,24 @@ fn git_graph_for_path(cwd: &Path) -> Result<GitGraphView, String> {
     Ok(parse_git_graph_output(&output))
 }
 
-fn git_commit_detail_for_path(cwd: &Path, hash: &str) -> Result<GitCommitDetailView, String> {
+#[cfg(test)]
+fn git_graph_for_path(cwd: &Path) -> Result<GitGraphView, String> {
+    git_graph_on(&ExecutionTarget::Local, &cwd.to_string_lossy())
+}
+
+fn git_commit_detail_on(
+    target: &ExecutionTarget,
+    cwd: &str,
+    hash: &str,
+) -> Result<GitCommitDetailView, String> {
     if !(7..=40).contains(&hash.len()) || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("Invalid commit hash.".into());
     }
-    let metadata = git_checked(cwd, &["show", "-s", "--format=%H%n%P%n%an%n%aI%n%s", hash])?;
+    let metadata = git_checked_on(
+        target,
+        cwd,
+        &["show", "-s", "--format=%H%n%P%n%an%n%aI%n%s", hash],
+    )?;
     let mut lines = metadata.lines();
     let resolved_hash = lines.next().ok_or("Commit not found.")?.to_owned();
     let parents = lines
@@ -1775,9 +2307,11 @@ fn git_commit_detail_for_path(cwd: &Path, hash: &str) -> Result<GitCommitDetailV
     let author = lines.next().unwrap_or_default().to_owned();
     let date = lines.next().unwrap_or_default().to_owned();
     let subject = lines.next().unwrap_or_default().to_owned();
-    let body = git_checked(cwd, &["show", "-s", "--format=%B", &resolved_hash])?;
-    let stats = git_checked(cwd, &["show", "--format=", "--shortstat", &resolved_hash])?;
-    let files = git_checked(
+    let body = git_checked_on(target, cwd, &["show", "-s", "--format=%B", &resolved_hash])?;
+    let stats =
+        git_checked_on(target, cwd, &["show", "--format=", "--shortstat", &resolved_hash])?;
+    let files = git_checked_on(
+        target,
         cwd,
         &[
             "diff-tree",
@@ -1803,7 +2337,7 @@ fn git_commit_detail_for_path(cwd: &Path, hash: &str) -> Result<GitCommitDetailV
     .collect();
     Ok(GitCommitDetailView {
         short_hash: resolved_hash.chars().take(7).collect(),
-        refs: git_refs_for_commit(cwd, &resolved_hash)?,
+        refs: git_refs_for_commit_on(target, cwd, &resolved_hash)?,
         hash: resolved_hash,
         parents,
         author,
@@ -1813,6 +2347,11 @@ fn git_commit_detail_for_path(cwd: &Path, hash: &str) -> Result<GitCommitDetailV
         stats,
         files,
     })
+}
+
+#[cfg(test)]
+fn git_commit_detail_for_path(cwd: &Path, hash: &str) -> Result<GitCommitDetailView, String> {
+    git_commit_detail_on(&ExecutionTarget::Local, &cwd.to_string_lossy(), hash)
 }
 
 fn codex_session_id(root_pid: Option<u32>) -> Option<String> {
@@ -1864,11 +2403,16 @@ fn cleanup_handoffs(directory: &Path) {
     }
 }
 
-fn render_handoff(project: &Project, window: &StoredWindow, snapshot: &RuntimeSnapshot) -> String {
-    let branch = git_output(&window.cwd, &["branch", "--show-current"]);
-    let status = git_output(&window.cwd, &["status", "--short"]);
-    let diff = git_output(&window.cwd, &["diff", "--stat"]);
-    let commits = git_output(&window.cwd, &["log", "-5", "--oneline"]);
+fn render_handoff(
+    target: &ExecutionTarget,
+    project: &Project,
+    window: &StoredWindow,
+    snapshot: &RuntimeSnapshot,
+) -> String {
+    let branch = git_output_on(target, &window.cwd, &["branch", "--show-current"]);
+    let status = git_output_on(target, &window.cwd, &["status", "--short"]);
+    let diff = git_output_on(target, &window.cwd, &["diff", "--stat"]);
+    let commits = git_output_on(target, &window.cwd, &["log", "-5", "--oneline"]);
     let timeline = window
         .timeline
         .iter()
@@ -1891,7 +2435,7 @@ fn render_handoff(project: &Project, window: &StoredWindow, snapshot: &RuntimeSn
         .map(|port| format!("- {} — {} ({})", port.url, port.process, port.pid))
         .collect::<Vec<_>>()
         .join("\n");
-    let pane = capture_pane(window);
+    let pane = capture_pane_on(target, window);
     format!(
         "# Agent Grid handoff\n\n\
 Generated: {generated}\n\n\
@@ -1944,19 +2488,47 @@ fn stop_connection(id: &str, state: &RuntimeState) {
 }
 
 fn refresh_runtime(state: &RuntimeState) -> Result<HashMap<String, RuntimeSnapshot>, String> {
-    let windows: Vec<StoredWindow> = {
+    let (windows, profiles) = {
         let store = state.store.lock().map_err(|error| error.to_string())?;
-        store
-            .data
-            .projects
-            .iter()
-            .flat_map(|project| project.windows.clone())
-            .collect()
+        (
+            store
+                .data
+                .projects
+                .iter()
+                .flat_map(|project| project.windows.clone())
+                .collect::<Vec<_>>(),
+            store.data.ssh_profiles.clone(),
+        )
     };
-    let snapshots = {
+    let local_windows = windows
+        .iter()
+        .filter(|window| window.ssh_profile_id.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut snapshots = {
         let mut omp_states = state.omp_states.lock().map_err(|error| error.to_string())?;
-        collect_runtime_snapshots(&windows, &mut omp_states)
+        collect_runtime_snapshots(&local_windows, &mut omp_states)
     };
+    for profile in profiles {
+        let remote_windows = windows
+            .iter()
+            .filter(|window| window.ssh_profile_id.as_deref() == Some(profile.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if remote_windows.is_empty() {
+            continue;
+        }
+        let target = ExecutionTarget::Ssh {
+            profile_id: profile.id.clone(),
+            host: profile.host.clone(),
+        };
+        snapshots.extend(collect_remote_runtime_snapshots(
+            state,
+            &profile,
+            &target,
+            &remote_windows,
+        ));
+    }
     let mut previous = state.snapshots.lock().map_err(|error| error.to_string())?;
     let mut store = state.store.lock().map_err(|error| error.to_string())?;
     let mut changed = false;
@@ -2038,6 +2610,116 @@ fn refresh_runtime(state: &RuntimeState) -> Result<HashMap<String, RuntimeSnapsh
 fn get_config() -> serde_json::Value {
     let default_cwd = dirs::home_dir().unwrap_or_default().join("projects");
     serde_json::json!({ "defaultCwd": default_cwd, "defaultCommand": "omp" })
+}
+
+fn validated_ssh_profile(input: SshProfileInput) -> Result<(String, String), String> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err("SSH profile name is required.".into());
+    }
+    Ok((
+        name.chars().take(60).collect(),
+        validate_ssh_host(&input.host, "SSH Host alias")?,
+    ))
+}
+
+#[tauri::command]
+fn get_ssh_profiles(state: State<'_, RuntimeState>) -> Result<Vec<SshProfile>, String> {
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    Ok(store.data.ssh_profiles.clone())
+}
+
+#[tauri::command]
+fn create_ssh_profile(
+    input: SshProfileInput,
+    state: State<'_, RuntimeState>,
+) -> Result<SshProfile, String> {
+    let (name, host) = validated_ssh_profile(input)?;
+    let profile = SshProfile {
+        id: short_id(),
+        name,
+        host,
+        created_at: timestamp(),
+    };
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
+    store.data.ssh_profiles.push(profile.clone());
+    store.save()?;
+    Ok(profile)
+}
+
+#[tauri::command]
+fn update_ssh_profile(
+    id: String,
+    input: SshProfileInput,
+    state: State<'_, RuntimeState>,
+) -> Result<SshProfile, String> {
+    let (name, host) = validated_ssh_profile(input)?;
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
+    let position = store
+        .data
+        .ssh_profiles
+        .iter()
+        .position(|profile| profile.id == id)
+        .ok_or("SSH profile not found.")?;
+    let host_changed = store.data.ssh_profiles[position].host != host;
+    if store.data.ssh_profiles[position].host != host
+        && store.data.projects.iter().any(|project| {
+            project.ssh_profile_id.as_deref() == Some(&id) && !project.windows.is_empty()
+        })
+    {
+        return Err("Close all windows using this profile before changing its Host alias.".into());
+    }
+    store.data.ssh_profiles[position].name = name;
+    store.data.ssh_profiles[position].host = host;
+    let updated = store.data.ssh_profiles[position].clone();
+    store.save()?;
+    drop(store);
+    if host_changed {
+        let mut forwards = state
+            .remote_forwards
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let keys = forwards
+            .keys()
+            .filter(|key| key.starts_with(&format!("{id}:")))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(mut forward) = forwards.remove(&key) {
+                let _ = forward.child.kill();
+                let _ = forward.child.wait();
+            }
+        }
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn delete_ssh_profile(id: String, state: State<'_, RuntimeState>) -> Result<(), String> {
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
+    if store
+        .data
+        .projects
+        .iter()
+        .any(|project| project.ssh_profile_id.as_deref() == Some(&id))
+    {
+        return Err("SSH profile is still used by a project.".into());
+    }
+    let count = store.data.ssh_profiles.len();
+    store.data.ssh_profiles.retain(|profile| profile.id != id);
+    if store.data.ssh_profiles.len() == count {
+        return Err("SSH profile not found.".into());
+    }
+    store.save()
+}
+
+#[tauri::command]
+fn test_ssh_profile(id: String, state: State<'_, RuntimeState>) -> Result<String, String> {
+    let target = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        execution_target(&store.data, Some(&id))?
+    };
+    target_checked(&target, "sh", &["-lc", "printf 'connected'"])
 }
 
 fn validate_ssh_host(value: &str, label: &str) -> Result<String, String> {
@@ -2426,6 +3108,8 @@ fn parse_docker_apps(raw: &str) -> Result<Vec<RunningAppGroupView>, String> {
                     let candidate = RunningAppPortView {
                         url: docker_browser_url(host_ip, host_port, container_port),
                         label: format!("{host_port} → {container_port}/{protocol}"),
+                        remote_port: None,
+                        ssh_profile_id: None,
                     };
                     ports
                         .entry((host_port, container_port))
@@ -2473,11 +3157,10 @@ fn parse_docker_apps(raw: &str) -> Result<Vec<RunningAppGroupView>, String> {
     Ok(groups)
 }
 
-fn docker_running_apps() -> Result<Vec<RunningAppGroupView>, String> {
-    let output = Command::new("docker")
-        .args(["ps", "-q", "--no-trunc"])
-        .output()
-        .map_err(|error| format!("Docker CLI is unavailable: {error}"))?;
+fn docker_running_apps_on(
+    target: &ExecutionTarget,
+) -> Result<Vec<RunningAppGroupView>, String> {
+    let output = target_output(target, "docker", &["ps", "-q", "--no-trunc"])?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(if detail.is_empty() {
@@ -2493,11 +3176,9 @@ fn docker_running_apps() -> Result<Vec<RunningAppGroupView>, String> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut command = Command::new("docker");
-    command.arg("inspect").args(&ids);
-    let output = command
-        .output()
-        .map_err(|error| format!("Could not inspect Docker containers: {error}"))?;
+    let mut args = vec!["inspect"];
+    args.extend(ids.iter().map(String::as_str));
+    let output = target_output(target, "docker", &args)?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(if detail.is_empty() {
@@ -2507,6 +3188,10 @@ fn docker_running_apps() -> Result<Vec<RunningAppGroupView>, String> {
         });
     }
     parse_docker_apps(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn docker_running_apps() -> Result<Vec<RunningAppGroupView>, String> {
+    docker_running_apps_on(&ExecutionTarget::Local)
 }
 
 fn internal_app_process(process: &str) -> bool {
@@ -2543,6 +3228,8 @@ fn local_running_apps(
                         .map(|port| RunningAppPortView {
                             url: port.url.clone(),
                             label: format!(":{} · {}", port.port, port.process),
+                            remote_port: None,
+                            ssh_profile_id: None,
                         })
                         .collect::<Vec<_>>();
                     if ports.is_empty() {
@@ -2572,6 +3259,99 @@ fn local_running_apps(
         })
         .collect()
 }
+
+fn ensure_remote_forward(
+    state: &RuntimeState,
+    profile: &SshProfile,
+    remote_port: u16,
+) -> Result<u16, String> {
+    let key = format!("{}:{remote_port}", profile.id);
+    let mut forwards = state
+        .remote_forwards
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(forward) = forwards.get_mut(&key) {
+        if forward
+            .child
+            .try_wait()
+            .is_ok_and(|status| status.is_none())
+        {
+            return Ok(forward.local_port);
+        }
+        forwards.remove(&key);
+    }
+    let listener = TcpListener::bind(("127.0.0.1", remote_port))
+        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
+        .map_err(|error| format!("Could not reserve a local forwarding port: {error}"))?;
+    let local_port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    drop(listener);
+    let forwarding = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
+    let mut child = Command::new("ssh")
+        .args([
+            "-N",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-L",
+            &forwarding,
+            &profile.host,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Could not start SSH port forward: {error}"))?;
+    thread::sleep(Duration::from_millis(150));
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| format!("Could not verify SSH port forward: {error}"))?
+    {
+        return Err(format!("SSH port forward exited immediately ({status})."));
+    }
+    forwards.insert(key, RemoteForward { child, local_port });
+    Ok(local_port)
+}
+
+fn prepare_remote_app_groups(
+    state: &RuntimeState,
+    profile: &SshProfile,
+    groups: &mut [RunningAppGroupView],
+) -> Result<(), String> {
+    for group in groups {
+        group.id = format!("remote:{}:{}", profile.id, group.id);
+        group.source = format!("{} · {}", profile.name, group.source);
+        for service in &mut group.services {
+            for port in &mut service.ports {
+                let remote_port = port
+                    .label
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .ok_or("Could not identify remote published port.")?;
+                let local_port = ensure_remote_forward(state, profile, remote_port)?;
+                let scheme = if port.url.starts_with("https:") {
+                    "https"
+                } else {
+                    "http"
+                };
+                port.url = format!("{scheme}://127.0.0.1:{local_port}");
+                port.remote_port = Some(remote_port);
+                port.ssh_profile_id = Some(profile.id.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 
 fn apply_opening_urls(
     groups: &mut [RunningAppGroupView],
@@ -2614,10 +3394,11 @@ fn validate_opening_url(value: &str) -> Result<String, String> {
 
 #[tauri::command]
 fn get_running_apps(state: State<'_, RuntimeState>) -> Result<RunningAppsView, String> {
-    let (projects, opening_urls) = {
+    let (projects, profiles, opening_urls) = {
         let store = state.store.lock().map_err(|error| error.to_string())?;
         (
             store.data.projects.clone(),
+            store.data.ssh_profiles.clone(),
             store.data.app_opening_urls.clone(),
         )
     };
@@ -2627,13 +3408,34 @@ fn get_running_apps(state: State<'_, RuntimeState>) -> Result<RunningAppsView, S
         .map_err(|error| error.to_string())?
         .clone();
     let mut groups = local_running_apps(&projects, &snapshots);
-    let docker_error = match docker_running_apps() {
-        Ok(mut docker_groups) => {
-            groups.append(&mut docker_groups);
-            None
+    let mut errors = Vec::new();
+    match docker_running_apps() {
+        Ok(mut docker_groups) => groups.append(&mut docker_groups),
+        Err(error) => errors.push(format!("Local Docker: {error}")),
+    }
+    let used_profiles = projects
+        .iter()
+        .filter_map(|project| project.ssh_profile_id.as_deref())
+        .collect::<HashSet<_>>();
+    for profile in profiles
+        .iter()
+        .filter(|profile| used_profiles.contains(profile.id.as_str()))
+    {
+        let target = ExecutionTarget::Ssh {
+            profile_id: profile.id.clone(),
+            host: profile.host.clone(),
+        };
+        match docker_running_apps_on(&target) {
+            Ok(mut remote_groups) => {
+                if let Err(error) = prepare_remote_app_groups(&state, profile, &mut remote_groups) {
+                    errors.push(format!("{}: {error}", profile.name));
+                } else {
+                    groups.append(&mut remote_groups);
+                }
+            }
+            Err(error) => errors.push(format!("{}: {error}", profile.name)),
         }
-        Err(error) => Some(error),
-    };
+    }
     groups.sort_by(|left, right| {
         left.kind
             .cmp(&right.kind)
@@ -2644,7 +3446,7 @@ fn get_running_apps(state: State<'_, RuntimeState>) -> Result<RunningAppsView, S
     Ok(RunningAppsView {
         groups,
         service_count,
-        docker_error,
+        docker_error: (!errors.is_empty()).then(|| errors.join(" · ")),
     })
 }
 
@@ -2655,7 +3457,7 @@ fn set_app_opening_url(
     state: State<'_, RuntimeState>,
 ) -> Result<Option<String>, String> {
     if group_id.len() > 300
-        || !["compose:", "docker:", "project:"]
+        || !["compose:", "docker:", "project:", "remote:"]
             .iter()
             .any(|prefix| group_id.starts_with(prefix))
         || group_id
@@ -2805,22 +3607,53 @@ fn get_projects(state: State<'_, RuntimeState>) -> Result<Vec<ProjectView>, Stri
         .data
         .projects
         .iter()
-        .map(|project| ProjectView {
-            id: project.id.clone(),
-            name: project.name.clone(),
-            cwd: project.cwd.clone(),
-            default_command: project.default_command.clone(),
-            created_at: project.created_at.clone(),
-            windows: project
-                .windows
-                .iter()
-                .map(|window| window_view(window, snapshots.get(&window.id)))
-                .collect(),
+        .map(|project| {
+            let profile_name = project.ssh_profile_id.as_ref().and_then(|id| {
+                store
+                    .data
+                    .ssh_profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .map(|profile| profile.name.clone())
+            });
+            ProjectView {
+                id: project.id.clone(),
+                name: project.name.clone(),
+                cwd: project.cwd.clone(),
+                default_command: project.default_command.clone(),
+                created_at: project.created_at.clone(),
+                ssh_profile_id: project.ssh_profile_id.clone(),
+                ssh_profile_name: profile_name,
+                remote: project.ssh_profile_id.is_some(),
+                windows: project
+                    .windows
+                    .iter()
+                    .map(|window| window_view(window, snapshots.get(&window.id)))
+                    .collect(),
+            }
         })
         .collect())
 }
 
-fn validated_project_fields(input: &ProjectInput) -> Result<(String, String, String), String> {
+fn validate_directory_on(target: &ExecutionTarget, value: &str) -> Result<String, String> {
+    if matches!(target, ExecutionTarget::Local) {
+        return validate_directory(value);
+    }
+    let value = value.trim();
+    if !value.starts_with('/') || value.chars().any(char::is_control) {
+        return Err("Remote project directory must be an absolute path.".into());
+    }
+    let canonical = target_checked(target, "realpath", &["-e", value])?;
+    if !target_success(target, "test", &["-d", &canonical]) {
+        return Err(format!("Remote directory does not exist: {value}"));
+    }
+    Ok(canonical)
+}
+
+fn validated_project_fields_on(
+    input: &ProjectInput,
+    target: &ExecutionTarget,
+) -> Result<(String, String, String), String> {
     let name = input.name.trim();
     let default_command = input.default_command.trim();
     if name.is_empty() {
@@ -2831,17 +3664,28 @@ fn validated_project_fields(input: &ProjectInput) -> Result<(String, String, Str
     }
     Ok((
         name.chars().take(60).collect(),
-        validate_directory(&input.cwd)?,
+        validate_directory_on(target, &input.cwd)?,
         default_command.into(),
     ))
 }
 
-fn update_project_record(project: &mut Project, input: ProjectInput) -> Result<(), String> {
-    let (name, cwd, default_command) = validated_project_fields(&input)?;
+
+fn update_project_record_on(
+    project: &mut Project,
+    input: ProjectInput,
+    target: &ExecutionTarget,
+) -> Result<(), String> {
+    let (name, cwd, default_command) = validated_project_fields_on(&input, target)?;
     project.name = name;
     project.cwd = cwd;
     project.default_command = default_command;
+    project.ssh_profile_id = input.ssh_profile_id;
     Ok(())
+}
+
+#[cfg(test)]
+fn update_project_record(project: &mut Project, input: ProjectInput) -> Result<(), String> {
+    update_project_record_on(project, input, &ExecutionTarget::Local)
 }
 
 fn reorder_project_records(projects: &mut [Project], ids: &[String]) -> Result<(), String> {
@@ -2866,13 +3710,18 @@ fn reorder_project_records(projects: &mut [Project], ids: &[String]) -> Result<(
 
 #[tauri::command]
 fn create_project(input: ProjectInput, state: State<'_, RuntimeState>) -> Result<Project, String> {
-    let (name, cwd, default_command) = validated_project_fields(&input)?;
+    let target = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        execution_target(&store.data, input.ssh_profile_id.as_deref())?
+    };
+    let (name, cwd, default_command) = validated_project_fields_on(&input, &target)?;
     let project = Project {
         id: short_id(),
         name,
         cwd,
         default_command,
         created_at: timestamp(),
+        ssh_profile_id: input.ssh_profile_id,
         windows: Vec::new(),
     };
     let mut store = state.store.lock().map_err(|error| error.to_string())?;
@@ -2887,6 +3736,19 @@ fn update_project(
     input: ProjectInput,
     state: State<'_, RuntimeState>,
 ) -> Result<Project, String> {
+    let target = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        let project = store
+            .data
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .ok_or("Project not found.")?;
+        if !project.windows.is_empty() && project.ssh_profile_id != input.ssh_profile_id {
+            return Err("Close all project windows before changing its SSH profile.".into());
+        }
+        execution_target(&store.data, input.ssh_profile_id.as_deref())?
+    };
     let mut store = state.store.lock().map_err(|error| error.to_string())?;
     let project = store
         .data
@@ -2894,7 +3756,7 @@ fn update_project(
         .iter_mut()
         .find(|project| project.id == id)
         .ok_or("Project not found.")?;
-    update_project_record(project, input)?;
+    update_project_record_on(project, input, &target)?;
     let updated = project.clone();
     store.save()?;
     Ok(updated)
@@ -2907,15 +3769,21 @@ fn reorder_projects(ids: Vec<String>, state: State<'_, RuntimeState>) -> Result<
     store.save()
 }
 
-fn project_path(project_id: &str, state: &RuntimeState) -> Result<PathBuf, String> {
+fn project_execution(
+    project_id: &str,
+    state: &RuntimeState,
+) -> Result<(ExecutionTarget, String), String> {
     let store = state.store.lock().map_err(|error| error.to_string())?;
-    store
+    let project = store
         .data
         .projects
         .iter()
         .find(|project| project.id == project_id)
-        .map(|project| PathBuf::from(&project.cwd))
-        .ok_or_else(|| "Project not found.".into())
+        .ok_or("Project not found.")?;
+    Ok((
+        execution_target(&store.data, project.ssh_profile_id.as_deref())?,
+        project.cwd.clone(),
+    ))
 }
 
 #[tauri::command]
@@ -2923,7 +3791,8 @@ fn get_git_status(
     project_id: String,
     state: State<'_, RuntimeState>,
 ) -> Result<GitStatusView, String> {
-    git_status_for_path(&project_path(&project_id, &state)?)
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    git_status_on(&target, &cwd)
 }
 
 #[tauri::command]
@@ -2932,17 +3801,20 @@ fn switch_git_branch(
     branch: String,
     state: State<'_, RuntimeState>,
 ) -> Result<GitStatusView, String> {
-    switch_git_branch_for_path(&project_path(&project_id, &state)?, &branch)
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    switch_git_branch_on(&target, &cwd, &branch)
 }
 
 #[tauri::command]
 fn pull_git(project_id: String, state: State<'_, RuntimeState>) -> Result<GitStatusView, String> {
-    pull_git_for_path(&project_path(&project_id, &state)?)
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    pull_git_on(&target, &cwd)
 }
 
 #[tauri::command]
 fn push_git(project_id: String, state: State<'_, RuntimeState>) -> Result<GitStatusView, String> {
-    push_git_for_path(&project_path(&project_id, &state)?)
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    push_git_on(&target, &cwd)
 }
 
 #[tauri::command]
@@ -2950,7 +3822,8 @@ fn get_git_graph(
     project_id: String,
     state: State<'_, RuntimeState>,
 ) -> Result<GitGraphView, String> {
-    git_graph_for_path(&project_path(&project_id, &state)?)
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    git_graph_on(&target, &cwd)
 }
 
 #[tauri::command]
@@ -2959,7 +3832,8 @@ fn get_git_commit(
     hash: String,
     state: State<'_, RuntimeState>,
 ) -> Result<GitCommitDetailView, String> {
-    git_commit_detail_for_path(&project_path(&project_id, &state)?, &hash)
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    git_commit_detail_on(&target, &cwd, &hash)
 }
 
 #[tauri::command]
@@ -2967,7 +3841,8 @@ fn get_repository(
     project_id: String,
     state: State<'_, RuntimeState>,
 ) -> Result<RepositoryView, String> {
-    list_repository_path(&project_path(&project_id, &state)?)
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    list_repository_on(&target, &cwd)
 }
 
 #[tauri::command]
@@ -2976,7 +3851,8 @@ fn read_repository_file(
     path: String,
     state: State<'_, RuntimeState>,
 ) -> Result<RepositoryFileView, String> {
-    read_repository_path(&project_path(&project_id, &state)?, &path)
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    read_repository_on(&target, &cwd, &path)
 }
 
 #[tauri::command]
@@ -2989,11 +3865,27 @@ fn open_project_in_editor(
     if editor_command.is_empty() {
         return Err("Choose an editor in Settings first.".into());
     }
-    let root = canonical_repository_root(&project_path(&project_id, &state)?)?;
-    let mut child = Command::new(editor_command)
-        .arg(root)
-        .spawn()
-        .map_err(|error| format!("Could not start {editor_command}: {error}"))?;
+    let (target, cwd) = project_execution(&project_id, &state)?;
+    let mut child = match target {
+        ExecutionTarget::Local => {
+            let root = canonical_repository_root(Path::new(&cwd))?;
+            Command::new(editor_command)
+                .arg(root)
+                .spawn()
+                .map_err(|error| format!("Could not start {editor_command}: {error}"))?
+        }
+        ExecutionTarget::Ssh { host, .. } => {
+            if !matches!(editor_command, "code" | "cursor") {
+                return Err(
+                    "Remote editor launch currently supports Visual Studio Code and Cursor.".into(),
+                );
+            }
+            Command::new(editor_command)
+                .args(["--remote", &format!("ssh-remote+{host}"), &cwd])
+                .spawn()
+                .map_err(|error| format!("Could not start {editor_command}: {error}"))?
+        }
+    };
     thread::spawn(move || {
         let _ = child.wait();
     });
@@ -3002,18 +3894,23 @@ fn open_project_in_editor(
 
 #[tauri::command]
 fn delete_project(id: String, state: State<'_, RuntimeState>) -> Result<(), String> {
-    let mut store = state.store.lock().map_err(|error| error.to_string())?;
-    let project = store
-        .data
-        .projects
-        .iter()
-        .find(|project| project.id == id)
-        .cloned()
-        .ok_or("Project not found.")?;
+    let (project, target) = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        let project = store
+            .data
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .cloned()
+            .ok_or("Project not found.")?;
+        let target = execution_target(&store.data, project.ssh_profile_id.as_deref())?;
+        (project, target)
+    };
     for window in &project.windows {
         stop_connection(&window.id, &state);
-        kill_session(&window.session_name);
+        kill_session_on(&target, &window.session_name);
     }
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
     store.data.projects.retain(|project| project.id != id);
     store.save()
 }
@@ -3024,17 +3921,19 @@ fn create_window(
     input: WindowInput,
     state: State<'_, RuntimeState>,
 ) -> Result<WindowView, String> {
-    {
+    let (target, ssh_profile_id) = {
         let store = state.store.lock().map_err(|error| error.to_string())?;
-        if !store
+        let project = store
             .data
             .projects
             .iter()
-            .any(|project| project.id == project_id)
-        {
-            return Err("Project not found.".into());
-        }
-    }
+            .find(|project| project.id == project_id)
+            .ok_or("Project not found.")?;
+        (
+            execution_target(&store.data, project.ssh_profile_id.as_deref())?,
+            project.ssh_profile_id.clone(),
+        )
+    };
     let name = input.name.trim();
     if name.is_empty() {
         return Err("Window name is required.".into());
@@ -3054,7 +3953,7 @@ fn create_window(
         session_name: format!("agent-grid-{id}"),
         id,
         name: name.chars().take(60).collect(),
-        cwd: validate_directory(&input.cwd)?,
+        cwd: validate_directory_on(&target, &input.cwd)?,
         command: input
             .command
             .map(|command| command.trim().to_owned())
@@ -3062,9 +3961,10 @@ fn create_window(
         kind: input.kind,
         created_at: timestamp(),
         timeline: Vec::new(),
+        ssh_profile_id,
     };
     append_timeline_event(&mut window, "activity", "Window created", None);
-    start_session(&window)?;
+    start_session_on(&target, &window)?;
     let mut store = state.store.lock().map_err(|error| error.to_string())?;
     let project = store
         .data
@@ -3074,7 +3974,7 @@ fn create_window(
         .ok_or("Project not found.")?;
     project.windows.push(window.clone());
     if let Err(error) = store.save() {
-        kill_session(&window.session_name);
+        kill_session_on(&target, &window.session_name);
         return Err(error);
     }
     Ok(window_view(&window, None))
@@ -3082,10 +3982,15 @@ fn create_window(
 
 #[tauri::command]
 fn delete_window(id: String, state: State<'_, RuntimeState>) -> Result<(), String> {
-    let mut store = state.store.lock().map_err(|error| error.to_string())?;
-    let window = store.find_window(&id).cloned().ok_or("Window not found.")?;
+    let (window, target) = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        let window = store.find_window(&id).cloned().ok_or("Window not found.")?;
+        let target = execution_target(&store.data, window.ssh_profile_id.as_deref())?;
+        (window, target)
+    };
     stop_connection(&id, &state);
-    kill_session(&window.session_name);
+    kill_session_on(&target, &window.session_name);
+    let mut store = state.store.lock().map_err(|error| error.to_string())?;
     for project in &mut store.data.projects {
         project.windows.retain(|window| window.id != id);
     }
@@ -3094,12 +3999,15 @@ fn delete_window(id: String, state: State<'_, RuntimeState>) -> Result<(), Strin
 
 #[tauri::command]
 fn restart_window(id: String, state: State<'_, RuntimeState>) -> Result<(), String> {
-    let store = state.store.lock().map_err(|error| error.to_string())?;
-    let window = store.find_window(&id).cloned().ok_or("Window not found.")?;
-    drop(store);
+    let (window, target) = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        let window = store.find_window(&id).cloned().ok_or("Window not found.")?;
+        let target = execution_target(&store.data, window.ssh_profile_id.as_deref())?;
+        (window, target)
+    };
     stop_connection(&id, &state);
-    kill_session(&window.session_name);
-    start_session(&window)
+    kill_session_on(&target, &window.session_name);
+    start_session_on(&target, &window)
 }
 
 #[tauri::command]
@@ -3211,9 +4119,9 @@ fn update_submission(
 #[tauri::command]
 fn create_handoff(id: String, state: State<'_, RuntimeState>) -> Result<HandoffView, String> {
     let snapshots = refresh_runtime(&state)?;
-    let (project, window) = {
+    let (project, window, target) = {
         let store = state.store.lock().map_err(|error| error.to_string())?;
-        store
+        let (project, window) = store
             .data
             .projects
             .iter()
@@ -3224,7 +4132,9 @@ fn create_handoff(id: String, state: State<'_, RuntimeState>) -> Result<HandoffV
                     .find(|window| window.id == id)
                     .map(|window| (project.clone(), window.clone()))
             })
-            .ok_or("Window not found.")?
+            .ok_or("Window not found.")?;
+        let target = execution_target(&store.data, project.ssh_profile_id.as_deref())?;
+        (project, window, target)
     };
     let snapshot = snapshots.get(&id).cloned().unwrap_or_default();
     let handoff_id = short_id();
@@ -3232,9 +4142,16 @@ fn create_handoff(id: String, state: State<'_, RuntimeState>) -> Result<HandoffV
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     cleanup_handoffs(&directory);
     let path = directory.join(format!("{handoff_id}.md"));
-    fs::write(&path, render_handoff(&project, &window, &snapshot))
-        .map_err(|error| error.to_string())?;
-    let path_text = path.to_string_lossy().into_owned();
+    let contents = render_handoff(&target, &project, &window, &snapshot);
+    fs::write(&path, &contents).map_err(|error| error.to_string())?;
+    let path_text = match &target {
+        ExecutionTarget::Local => path.to_string_lossy().into_owned(),
+        ExecutionTarget::Ssh { .. } => {
+            let remote_path = format!("/tmp/agent-grid-handoff-{handoff_id}.md");
+            write_remote_text(&target, &remote_path, &contents)?;
+            remote_path
+        }
+    };
     let copy_text = format!("Continue from this Agent Grid handoff. Read it first: {path_text}");
     let can_fork = codex_session_id(snapshot.pane_pid).is_some();
 
@@ -3282,9 +4199,9 @@ fn fork_handoff(
         return Err("Handoff snapshot was not found.".into());
     }
     let snapshots = refresh_runtime(&state)?;
-    let (project_id, project, source) = {
+    let (project_id, project, source, execution) = {
         let store = state.store.lock().map_err(|error| error.to_string())?;
-        store
+        let (project_id, project, source) = store
             .data
             .projects
             .iter()
@@ -3295,14 +4212,24 @@ fn fork_handoff(
                     .find(|window| window.id == source_id)
                     .map(|window| (project.id.clone(), project.clone(), window.clone()))
             })
-            .ok_or("Source window not found.")?
+            .ok_or("Source window not found.")?;
+        let execution = execution_target(&store.data, project.ssh_profile_id.as_deref())?;
+        (project_id, project, source, execution)
     };
     let session_id = snapshots
         .get(&source_id)
         .and_then(|snapshot| codex_session_id(snapshot.pane_pid));
+    let snapshot_path = match &execution {
+        ExecutionTarget::Local => path.to_string_lossy().into_owned(),
+        ExecutionTarget::Ssh { .. } => {
+            let remote_path = format!("/tmp/agent-grid-handoff-{handoff_id}.md");
+            let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            write_remote_text(&execution, &remote_path, &contents)?;
+            remote_path
+        }
+    };
     let prompt = format!(
-        "Continue this work. The transfer snapshot is at {}",
-        path.to_string_lossy()
+        "Continue this work. The transfer snapshot is at {snapshot_path}"
     );
     let (command, exact_fork) = if let Some(session_id) = session_id {
         (
@@ -3325,6 +4252,7 @@ fn fork_handoff(
         kind: WindowKind::Agent,
         created_at: timestamp(),
         timeline: Vec::new(),
+        ssh_profile_id: source.ssh_profile_id.clone(),
     };
     append_timeline_event(
         &mut window,
@@ -3332,7 +4260,8 @@ fn fork_handoff(
         format!("Opened from handoff {handoff_id}"),
         None,
     );
-    start_session(&window)?;
+
+    start_session_on(&execution, &window)?;
     let view = window_view(&window, None);
     let mut store = state.store.lock().map_err(|error| error.to_string())?;
     let target = store
@@ -3355,13 +4284,23 @@ fn fork_handoff(
         );
     }
     if let Err(error) = store.save() {
-        kill_session(&view.session_name);
+        kill_session_on(&execution, &view.session_name);
         return Err(error);
     }
     Ok(HandoffForkView {
         window: view,
         exact_fork,
     })
+}
+
+fn window_execution(
+    id: &str,
+    state: &RuntimeState,
+) -> Result<(StoredWindow, ExecutionTarget), String> {
+    let store = state.store.lock().map_err(|error| error.to_string())?;
+    let window = store.find_window(id).cloned().ok_or("Window not found.")?;
+    let target = execution_target(&store.data, window.ssh_profile_id.as_deref())?;
+    Ok((window, target))
 }
 
 #[tauri::command]
@@ -3372,13 +4311,11 @@ fn attach_terminal(
     on_event: Channel<TerminalEvent>,
     state: State<'_, RuntimeState>,
 ) -> Result<(), String> {
-    let store = state.store.lock().map_err(|error| error.to_string())?;
-    let window = store.find_window(&id).cloned().ok_or("Window not found.")?;
-    drop(store);
-    if !session_exists(&window.session_name) {
+    let (window, target) = window_execution(&id, &state)?;
+    if !session_exists_on(&target, &window.session_name) {
         return Err("tmux session is not running.".into());
     }
-    configure_session(&window.session_name)?;
+    configure_session_on(&target, &window.session_name)?;
     stop_connection(&id, &state);
 
     let pair = native_pty_system()
@@ -3389,8 +4326,31 @@ fn attach_terminal(
             pixel_height: 0,
         })
         .map_err(|error| error.to_string())?;
-    let mut command = CommandBuilder::new("tmux");
-    command.args(["attach-session", "-t", &window.session_name]);
+    let mut command = match &target {
+        ExecutionTarget::Local => {
+            let mut command = CommandBuilder::new("tmux");
+            command.args(["attach-session", "-t", &window.session_name]);
+            command
+        }
+        ExecutionTarget::Ssh { host, .. } => {
+            let mut command = CommandBuilder::new("ssh");
+            let remote = remote_shell_command(
+                "tmux",
+                &["attach-session", "-t", &window.session_name],
+            );
+            command.args([
+                "-tt",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                host,
+                "--",
+                &remote,
+            ]);
+            command
+        }
+    };
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     let child = pair
@@ -3451,21 +4411,18 @@ fn scroll_terminal_history(
     lines: i16,
     state: State<'_, RuntimeState>,
 ) -> Result<(), String> {
-    let target = {
-        let store = state.store.lock().map_err(|error| error.to_string())?;
-        let window = store.find_window(&id).ok_or("Window not found.")?;
-        format!("{}:0.0", window.session_name)
-    };
+    let (window, execution) = window_execution(&id, &state)?;
+    let target = format!("{}:0.0", window.session_name);
     let lines = lines.clamp(-100, 100);
     if lines == 0 {
         return Ok(());
     }
     if lines > 0 {
-        let status = Command::new("tmux")
-            .args(["copy-mode", "-e", "-t", &target])
-            .status()
-            .map_err(|error| error.to_string())?;
-        if !status.success() {
+        if !target_success(
+            &execution,
+            "tmux",
+            &["copy-mode", "-e", "-t", &target],
+        ) {
             return Err("Could not enter terminal history.".into());
         }
         state
@@ -3479,19 +4436,20 @@ fn scroll_terminal_history(
     } else {
         "scroll-down"
     };
-    let status = Command::new("tmux")
-        .args([
+    let count = lines.unsigned_abs().to_string();
+    if target_success(
+        &execution,
+        "tmux",
+        &[
             "send-keys",
             "-X",
             "-t",
             &target,
             "-N",
-            &lines.unsigned_abs().to_string(),
+            &count,
             command,
-        ])
-        .status()
-        .map_err(|error| error.to_string())?;
-    if status.success() {
+        ],
+    ) {
         Ok(())
     } else {
         Err("Could not scroll terminal history.".into())
@@ -3520,27 +4478,26 @@ fn jump_to_prompt(id: String, text: String, state: State<'_, RuntimeState>) -> R
     if pattern.is_empty() {
         return Err("Prompt is empty.".into());
     }
-    let target = {
-        let store = state.store.lock().map_err(|error| error.to_string())?;
-        let window = store.find_window(&id).ok_or("Window not found.")?;
-        format!("{}:0.0", window.session_name)
-    };
-    let entered = Command::new("tmux")
-        .args(["copy-mode", "-e", "-t", &target])
-        .status()
-        .map_err(|error| error.to_string())?;
-    let searched = Command::new("tmux")
-        .args([
+    let (window, execution) = window_execution(&id, &state)?;
+    let target = format!("{}:0.0", window.session_name);
+    let entered = target_success(
+        &execution,
+        "tmux",
+        &["copy-mode", "-e", "-t", &target],
+    );
+    let searched = target_success(
+        &execution,
+        "tmux",
+        &[
             "send-keys",
             "-X",
             "-t",
             &target,
             "search-backward",
             &pattern,
-        ])
-        .status()
-        .map_err(|error| error.to_string())?;
-    if !entered.success() || !searched.success() {
+        ],
+    );
+    if !entered || !searched {
         return Err("Prompt is no longer in tmux history.".into());
     }
     state
@@ -3559,16 +4516,13 @@ fn write_terminal(id: String, data: String, state: State<'_, RuntimeState>) -> R
         .map_err(|error| error.to_string())?
         .remove(&id);
     if was_in_history {
-        let target = {
-            let store = state.store.lock().map_err(|error| error.to_string())?;
-            store
-                .find_window(&id)
-                .map(|window| format!("{}:0.0", window.session_name))
-        };
-        if let Some(target) = target {
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-X", "-t", &target, "cancel"])
-                .status();
+        if let Ok((window, execution)) = window_execution(&id, &state) {
+            let target = format!("{}:0.0", window.session_name);
+            let _ = target_output(
+                &execution,
+                "tmux",
+                &["send-keys", "-X", "-t", &target, "cancel"],
+            );
         }
     }
     let mut connections = state
@@ -3670,6 +4624,7 @@ pub fn run() {
                 snapshots: Mutex::new(HashMap::new()),
                 omp_states: Mutex::new(HashMap::new()),
                 ssh_tunnel_processes: Mutex::new(HashMap::new()),
+                remote_forwards: Mutex::new(HashMap::new()),
                 compact_window: Mutex::new(None),
                 app_data_dir,
             });
@@ -3687,6 +4642,12 @@ pub fn run() {
                         let _ = child.wait();
                     }
                 }
+                if let Ok(mut forwards) = state.remote_forwards.lock() {
+                    for (_, mut forward) in forwards.drain() {
+                        let _ = forward.child.kill();
+                        let _ = forward.child.wait();
+                    }
+                }
                 return;
             }
             let Some(id) = window.label().strip_prefix("chat-") else {
@@ -3700,6 +4661,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_projects,
+            get_ssh_profiles,
+            create_ssh_profile,
+            update_ssh_profile,
+            delete_ssh_profile,
+            test_ssh_profile,
             get_ssh_tunnels,
             create_ssh_tunnel,
             update_ssh_tunnel,
@@ -3792,10 +4758,11 @@ mod tests {
     #[test]
     fn migrates_empty_flat_store() {
         let migrated = migrate_store(r#"{"agents":[]}"#).unwrap();
-        assert_eq!(migrated.version, 7);
+        assert_eq!(migrated.version, 8);
         assert!(migrated.projects.is_empty());
         assert!(migrated.ssh_tunnels.is_empty());
         assert!(migrated.app_opening_urls.is_empty());
+        assert!(migrated.ssh_profiles.is_empty());
     }
 
     #[test]
@@ -3914,6 +4881,8 @@ mod tests {
             [RunningAppPortView {
                 url: "http://127.0.0.1:8080".into(),
                 label: "8080 → 3000/tcp".into(),
+                remote_port: None,
+                ssh_profile_id: None,
             }]
         );
         let standalone = groups
@@ -3994,6 +4963,8 @@ mod tests {
             [RunningAppPortView {
                 url: "http://127.0.0.1:3000".into(),
                 label: ":3000 · node".into(),
+                remote_port: None,
+                ssh_profile_id: None,
             }]
         );
     }
@@ -4010,6 +4981,7 @@ mod tests {
                 name: "  Renamed project  ".into(),
                 cwd: "~".into(),
                 default_command: "omp --model slow".into(),
+                ssh_profile_id: None,
             },
         )
         .unwrap();
@@ -4270,6 +5242,23 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             "red\nplain"
         );
         assert_eq!(shell_quote("it's ready"), "'it'\"'\"'s ready'");
+        assert_eq!(
+            remote_shell_command("git", &["-C", "/tmp/it's ready", "status"]),
+            "'git' '-C' '/tmp/it'\"'\"'s ready' 'status'"
+        );
+        assert_eq!(
+            validated_ssh_profile(SshProfileInput {
+                name: "  Development  ".into(),
+                host: "marlene".into(),
+            })
+            .unwrap(),
+            ("Development".into(), "marlene".into())
+        );
+        assert!(validated_ssh_profile(SshProfileInput {
+            name: "Unsafe".into(),
+            host: "-oProxyCommand=bad".into(),
+        })
+        .is_err());
     }
 
     #[test]
@@ -4279,6 +5268,28 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             "Where did it fail?"
         );
         assert_eq!(tmux_search_pattern("find [this]?"), r"find \[this\]\?");
+    }
+
+    #[test]
+    fn maps_remote_listeners_to_terminal_process_trees() {
+        let processes = parse_remote_process_table(
+            "100 1 bash\n101 100 node\n102 1 postgres\n103 101 worker\n",
+        );
+        assert_eq!(
+            remote_process_tree(100, &processes),
+            HashSet::from([100, 101, 103])
+        );
+        let listeners = parse_remote_listeners(
+            "LISTEN 0 511 127.0.0.1:3000 0.0.0.0:* users:((\"node\",pid=101,fd=20))\n\
+             LISTEN 0 128 [::]:5432 [::]:* users:((\"postgres\",pid=102,fd=7))\n",
+        );
+        assert_eq!(
+            listeners,
+            vec![
+                (3000, "127.0.0.1".into(), 101, "node".into()),
+                (5432, "::".into(), 102, "postgres".into()),
+            ]
+        );
     }
 
     #[test]
@@ -4378,6 +5389,7 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             kind: WindowKind::Agent,
             created_at: timestamp(),
             timeline: Vec::new(),
+            ssh_profile_id: None,
         };
         let mut snapshot = RuntimeSnapshot {
             running: true,
@@ -4397,6 +5409,58 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
     }
 
     #[test]
+    fn runs_remote_workspace_transport_when_configured() {
+        let Ok(host) = std::env::var("AGENT_GRID_TEST_SSH_HOST") else {
+            return;
+        };
+        let target = ExecutionTarget::Ssh {
+            profile_id: "test".into(),
+            host,
+        };
+        assert_eq!(
+            target_checked(&target, "sh", &["-lc", "printf connected"]).unwrap(),
+            "connected"
+        );
+
+        let id = short_id();
+        let root = format!("/tmp/agent-grid-remote-{id}");
+        target_checked(&target, "mkdir", &["-p", &root]).unwrap();
+        write_remote_text(&target, &format!("{root}/README.md"), "# Remote\n").unwrap();
+        target_checked(&target, "git", &["-C", &root, "init", "-q"]).unwrap();
+        let repository = list_repository_on(&target, &root).unwrap();
+        assert!(repository
+            .entries
+            .iter()
+            .any(|entry| entry.path == "README.md" && !entry.is_directory));
+        assert_eq!(
+            read_repository_on(&target, &root, "README.md")
+                .unwrap()
+                .content,
+            "# Remote\n"
+        );
+        assert!(git_status_on(&target, &root).unwrap().available);
+
+        let window = StoredWindow {
+            id: id.clone(),
+            session_name: format!("agent-grid-{id}"),
+            name: "Remote test".into(),
+            cwd: root.clone(),
+            command: Some("printf remote-ready".into()),
+            kind: WindowKind::Agent,
+            created_at: timestamp(),
+            timeline: Vec::new(),
+            ssh_profile_id: Some("test".into()),
+        };
+        start_session_on(&target, &window).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(session_exists_on(&target, &window.session_name));
+        assert!(capture_pane_on(&target, &window).contains("remote-ready"));
+        kill_session_on(&target, &window.session_name);
+        let _ = target_output(&target, "rm", &["-rf", &root]);
+    }
+
+
+    #[test]
     fn starts_normal_terminal_and_agent_sessions() {
         let terminal_id = short_id();
         let terminal = StoredWindow {
@@ -4408,6 +5472,7 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             kind: WindowKind::Terminal,
             created_at: timestamp(),
             timeline: Vec::new(),
+            ssh_profile_id: None,
         };
         let _terminal_guard = SessionGuard(terminal.session_name.clone());
         start_session(&terminal).unwrap();
@@ -4429,6 +5494,7 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
             kind: WindowKind::Agent,
             created_at: timestamp(),
             timeline: Vec::new(),
+            ssh_profile_id: None,
         };
         let _agent_guard = SessionGuard(agent.session_name.clone());
         start_session(&agent).unwrap();

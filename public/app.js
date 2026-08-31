@@ -56,6 +56,9 @@ const sshTunnelsButton = document.querySelector("#ssh-tunnels-button");
 const runningAppsView = document.querySelector("#running-apps-view");
 const runningAppsList = document.querySelector("#running-apps-list");
 const runningAppsButton = document.querySelector("#running-apps-button");
+const sshProfileDialog = document.querySelector("#ssh-profile-dialog");
+const sshProfileForm = document.querySelector("#ssh-profile-form");
+const sshProfileList = document.querySelector("#ssh-profile-list");
 const terminals = new Map();
 const sidebarWidthKey = "agent-grid-sidebar-width";
 const projectSectionShareKey = "agent-grid-projects-share";
@@ -122,6 +125,8 @@ let runningApps = { groups: [], serviceCount: 0, dockerError: null };
 let runningAppsTimer;
 let runningAppsRequestInFlight = false;
 const appOpeningDrafts = new Map();
+let sshProfiles = [];
+let editingSshProfileId = null;
 let shortcutBindings = loadShortcutBindings();
 let recordingShortcut = null;
 let projectSwitchInFlight = false;
@@ -670,11 +675,12 @@ function renderProjects() {
   projectList.innerHTML = projects.map((project) => {
     return `
     <div class="project-row ${project.id === activeProjectId ? "active" : ""}" draggable="true" data-project-drag-id="${project.id}">
-      <button class="project-item" data-project-id="${project.id}" title="${escapeHtml(project.cwd)}">
-        <span class="project-icon">⌘</span>
+      <button class="project-item" data-project-id="${project.id}" title="${escapeHtml(project.remote ? `${project.sshProfileName} · ${project.cwd}` : project.cwd)}">
+        <span class="project-icon ${project.remote ? "remote" : ""}">${project.remote ? "⌁" : "⌘"}</span>
         <span class="project-copy">
           <span class="project-title">
             <span class="project-name">${escapeHtml(project.name)}</span>
+            ${project.remote ? `<span class="project-remote-badge">${escapeHtml(project.sshProfileName || "SSH")}</span>` : ""}
             ${projectStatusSquares(project)}
           </span>
           <span class="project-count">${project.windows.length} window${project.windows.length === 1 ? "" : "s"}</span>
@@ -701,7 +707,7 @@ function renderWindows() {
 function renderCompactNavigation() {
   compactProjectList.innerHTML = projects.map((project) =>
     `<button class="compact-nav-item ${project.id === activeProjectId ? "active" : ""}" data-compact-project="${project.id}">
-      <span>⌘</span><span><span class="compact-project-summary"><strong>${escapeHtml(project.name)}</strong>${projectStatusSquares(project)}</span><small>${project.windows.length} chats</small></span>
+      <span>${project.remote ? "⌁" : "⌘"}</span><span><span class="compact-project-summary"><strong>${escapeHtml(project.name)}</strong>${projectStatusSquares(project)}</span><small>${project.remote ? `${escapeHtml(project.sshProfileName || "SSH")} · ` : ""}${project.windows.length} chats</small></span>
     </button>`
   ).join("");
   compactWindowList.innerHTML = (activeProject()?.windows || []).map((window) => {
@@ -2113,6 +2119,75 @@ async function pollStatuses() {
   statusTimer = setTimeout(pollStatuses, 2500);
 }
 
+function renderProjectSshOptions(selected = "") {
+  const select = document.querySelector("#project-ssh-profile");
+  select.innerHTML = `<option value="">Local machine</option>${sshProfiles.map((profile) =>
+    `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.name)} · ${escapeHtml(profile.host)}</option>`
+  ).join("")}`;
+  select.value = selected || "";
+}
+
+function updateProjectLocationControls() {
+  const profileId = document.querySelector("#project-ssh-profile").value;
+  const remote = Boolean(profileId);
+  document.querySelector('[data-browse="project-cwd"]').hidden = remote;
+  document.querySelector("#project-location-help").textContent = remote
+    ? "tmux, commands, Git, files, Docker, and ports use the selected SSH host."
+    : "Commands, tmux, Git, and files use this machine.";
+  document.querySelector("#project-cwd").placeholder = remote
+    ? "/home/user/projects/application"
+    : config.defaultCwd;
+}
+
+function renderSshProfiles() {
+  sshProfileList.innerHTML = sshProfiles.length ? sshProfiles.map((profile) => `
+    <div class="ssh-profile-row" data-ssh-profile="${escapeHtml(profile.id)}">
+      <span class="ssh-profile-mark" aria-hidden="true">⌁</span>
+      <span><strong>${escapeHtml(profile.name)}</strong><small>Host ${escapeHtml(profile.host)}</small></span>
+      <button type="button" class="button ghost" data-ssh-profile-action="test">Test</button>
+      <button type="button" class="button ghost" data-ssh-profile-action="edit">Edit</button>
+      <button type="button" class="icon-button danger-button" data-ssh-profile-action="delete" title="Delete SSH connection">×</button>
+    </div>
+  `).join("") : `<p class="ssh-profile-empty">No SSH connections configured.</p>`;
+}
+
+async function refreshSshProfiles() {
+  sshProfiles = await call("get_ssh_profiles");
+  renderSshProfiles();
+}
+
+function openSshProfileModal(profile = null) {
+  editingSshProfileId = profile?.id || null;
+  document.querySelector("#ssh-profile-dialog-eyebrow").textContent = profile ? "SSH connection" : "Remote development";
+  document.querySelector("#ssh-profile-dialog-title").textContent = profile ? `Edit ${profile.name}` : "Add SSH connection";
+  document.querySelector("#save-ssh-profile-button").textContent = profile ? "Save changes" : "Save connection";
+  document.querySelector("#ssh-profile-name").value = profile?.name || "";
+  document.querySelector("#ssh-profile-host").value = profile?.host || "";
+  sshProfileDialog.showModal();
+  document.querySelector("#ssh-profile-name").focus();
+}
+
+async function testSshProfile(id) {
+  try {
+    await call("test_ssh_profile", { id });
+    showToast("SSH connection succeeded.");
+  } catch (error) {
+    showToast(`SSH connection failed: ${error.message}`, true);
+  }
+}
+
+async function deleteSshProfile(id) {
+  const profile = sshProfiles.find((item) => item.id === id);
+  if (!profile || !window.confirm(`Delete SSH connection “${profile.name}”?`)) return;
+  try {
+    await call("delete_ssh_profile", { id });
+    await refreshSshProfiles();
+    showToast("SSH connection deleted.");
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
 function openProjectModal() {
   editingProjectId = null;
   document.querySelector("#project-dialog-eyebrow").textContent = "New workspace";
@@ -2121,6 +2196,9 @@ function openProjectModal() {
   document.querySelector("#project-name").value = `Project ${projects.length + 1}`;
   document.querySelector("#project-cwd").value = config.defaultCwd;
   document.querySelector("#project-command").value = config.defaultCommand;
+  renderProjectSshOptions();
+  document.querySelector("#project-ssh-profile").disabled = false;
+  updateProjectLocationControls();
   projectDialog.showModal();
   document.querySelector("#project-name").select();
 }
@@ -2135,6 +2213,9 @@ function openProjectSettings(id) {
   document.querySelector("#project-name").value = project.name;
   document.querySelector("#project-cwd").value = project.cwd;
   document.querySelector("#project-command").value = project.defaultCommand;
+  renderProjectSshOptions(project.sshProfileId);
+  document.querySelector("#project-ssh-profile").disabled = project.windows.length > 0;
+  updateProjectLocationControls();
   projectDialog.showModal();
   document.querySelector("#project-name").select();
 }
@@ -2157,6 +2238,7 @@ function openWindowModal() {
   if (!project) return openProjectModal();
   document.querySelector("#window-cwd").value = project.cwd;
   document.querySelector("#window-command").value = project.defaultCommand;
+  document.querySelector('[data-browse="window-cwd"]').hidden = project.remote;
   windowDialog.showModal();
   setWindowKind("agent");
   document.querySelector("#window-name").select();
@@ -2360,6 +2442,7 @@ function openSettings() {
   updateFontControls();
   updateEditorControls();
   updateShortcutControls();
+  renderSshProfiles();
   settingsDialog.showModal();
 }
 
@@ -2383,12 +2466,20 @@ document.querySelector("#compact-mode-button").addEventListener("click", () => s
 document.querySelector("#settings-button").addEventListener("click", openSettings);
 document.querySelector("#terminal-font-size-range").addEventListener("input", (event) => setTerminalFontSize(event.target.value));
 settingsDialog.addEventListener("click", (event) => {
+  const profileAction = event.target.closest("[data-ssh-profile-action]")?.dataset.sshProfileAction;
+  const profileId = event.target.closest("[data-ssh-profile]")?.dataset.sshProfile;
+  const profile = sshProfiles.find((item) => item.id === profileId);
+  if (profileAction === "test" && profile) return testSshProfile(profile.id);
+  if (profileAction === "edit" && profile) return openSshProfileModal(profile);
+  if (profileAction === "delete" && profile) return deleteSshProfile(profile.id);
   const record = event.target.closest("[data-shortcut-record]")?.dataset.shortcutRecord;
   if (record) return beginShortcutRecording(record);
   const reset = event.target.closest("[data-shortcut-reset]")?.dataset.shortcutReset;
   if (reset) resetShortcutBinding(reset);
 });
 settingsDialog.addEventListener("close", cancelShortcutRecording);
+document.querySelector("#new-ssh-profile-button").addEventListener("click", () => openSshProfileModal());
+document.querySelector("#project-ssh-profile").addEventListener("change", updateProjectLocationControls);
 document.querySelector("#repository-button").addEventListener("click", () => {
   if (repositoryBrowser.hidden) openRepository();
   else closeRepository();
@@ -2574,13 +2665,40 @@ sshTunnelForm.addEventListener("submit", async (event) => {
   }
 });
 
+sshProfileForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = document.querySelector("#save-ssh-profile-button");
+  const input = {
+    name: document.querySelector("#ssh-profile-name").value,
+    host: document.querySelector("#ssh-profile-host").value
+  };
+  button.disabled = true;
+  try {
+    if (editingSshProfileId) {
+      await call("update_ssh_profile", { id: editingSshProfileId, input });
+      showToast("SSH connection updated.");
+    } else {
+      await call("create_ssh_profile", { input });
+      showToast("SSH connection saved.");
+    }
+    editingSshProfileId = null;
+    sshProfileDialog.close();
+    await refreshSshProfiles();
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 projectForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = document.querySelector("#save-project-button");
   const input = {
     name: document.querySelector("#project-name").value,
     cwd: document.querySelector("#project-cwd").value,
-    defaultCommand: document.querySelector("#project-command").value
+    defaultCommand: document.querySelector("#project-command").value,
+    sshProfileId: document.querySelector("#project-ssh-profile").value || null
   };
   button.disabled = true;
   try {
@@ -2834,6 +2952,7 @@ grid.addEventListener("pointerdown", (event) => {
 async function init() {
   try { config = await call("get_config"); }
   catch (error) { showToast(error.message, true); }
+  await refreshSshProfiles();
   await refreshSshTunnels({ quiet: true });
   await refreshProjects({ quiet: true });
   await refreshRunningApps({ quiet: true });
