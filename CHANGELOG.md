@@ -26,6 +26,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 - Newly created agent and terminal windows receive keyboard focus immediately.
 - Project switches focus the first available terminal, and hovering a terminal window moves keyboard focus to it.
 - SSH connection test results render inline in Settings instead of behind a modal backdrop.
+- Replaced the native Git branch `<select>` in the sidebar footer with a custom popup that positions itself in JS, flipping upward when there isn't room below. Under WSLg the native OS popup always opened downward regardless of available space, clipping the branch list at the bottom-left corner toolbar.
 
 ## [0.2.0] - 2026-08-26
 
