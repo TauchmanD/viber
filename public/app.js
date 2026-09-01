@@ -1732,10 +1732,13 @@ async function refreshRunningApps({ quiet = false } = {}) {
 function scheduleRunningAppsPoll() {
   clearTimeout(runningAppsTimer);
   if (popoutWindowId) return;
+  const interval = runningAppsView.hidden
+    ? (projects.some((project) => project.remote) ? 30000 : 15000)
+    : 5000;
   runningAppsTimer = setTimeout(async () => {
     if (!document.hidden) await refreshRunningApps({ quiet: true });
     scheduleRunningAppsPoll();
-  }, 5000);
+  }, interval);
 }
 
 async function openRunningApps() {
@@ -1748,6 +1751,7 @@ async function openRunningApps() {
   runningAppsButton.classList.add("active");
   runningAppsButton.setAttribute("aria-pressed", "true");
   await refreshRunningApps({ quiet: true });
+  scheduleRunningAppsPoll();
 }
 
 function closeRunningApps() {
@@ -1756,6 +1760,7 @@ function closeRunningApps() {
   grid.hidden = false;
   runningAppsButton.classList.remove("active");
   runningAppsButton.setAttribute("aria-pressed", "false");
+  scheduleRunningAppsPoll();
   requestAnimationFrame(() => terminals.forEach((entry) => entry.fitAddon.fit()));
 }
 
@@ -2102,10 +2107,11 @@ async function runGitOperation(command, args, successMessage) {
 
 function scheduleGitStatusPoll() {
   clearTimeout(gitStatusTimer);
+  const interval = activeProject()?.remote ? 15000 : 5000;
   gitStatusTimer = setTimeout(async () => {
     if (!document.hidden) await refreshGitStatus({ quiet: true });
     scheduleGitStatusPoll();
-  }, 5000);
+  }, interval);
 }
 
 async function pollStatuses() {
@@ -2122,7 +2128,7 @@ async function pollStatuses() {
       statusRequestInFlight = false;
     }
   }
-  statusTimer = setTimeout(pollStatuses, 2500);
+  statusTimer = setTimeout(pollStatuses, projects.some((project) => project.remote) ? 5000 : 2500);
 }
 
 function renderProjectSshOptions(selected = "") {
@@ -3046,7 +3052,7 @@ async function init() {
   await refreshSshProfiles();
   await refreshSshTunnels({ quiet: true });
   await refreshProjects({ quiet: true });
-  await refreshRunningApps({ quiet: true });
+  refreshRunningApps({ quiet: true });
   pollStatuses();
   scheduleGitStatusPoll();
   scheduleRunningAppsPoll();

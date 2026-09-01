@@ -7,7 +7,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, TcpListener},
     path::{Path, PathBuf},
     process::{Child as ProcessChild, Command, Stdio},
-    sync::Mutex,
+    sync::{LazyLock, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -845,6 +845,38 @@ enum ExecutionTarget {
     Ssh { profile_id: String, host: String },
 }
 
+fn ssh_control_path() -> &'static str {
+    static CONTROL_PATH: LazyLock<String> = LazyLock::new(|| {
+        std::env::temp_dir()
+            .join(format!("tmux-agent-grid-{}-%C", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    });
+    &CONTROL_PATH
+}
+fn configure_multiplexed_ssh(command: &mut Command) {
+    command.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=120",
+        "-o",
+        &format!("ControlPath={}", ssh_control_path()),
+    ]);
+}
+
+fn close_ssh_master(host: &str) {
+    let _ = Command::new("ssh")
+        .args(["-S", ssh_control_path(), "-O", "exit", host])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn remote_shell_command(program: &str, args: &[&str]) -> String {
     std::iter::once(program)
         .chain(args.iter().copied())
@@ -866,16 +898,8 @@ fn target_output(
         }
         ExecutionTarget::Ssh { host, .. } => {
             let mut command = Command::new("ssh");
-            command.args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-T",
-                host,
-                "--",
-                &remote_shell_command(program, args),
-            ]);
+            configure_multiplexed_ssh(&mut command);
+            command.args(["-T", host, "--", &remote_shell_command(program, args)]);
             command
         }
     };
@@ -901,8 +925,10 @@ fn write_remote_text(
         "umask 077 && cat > {}",
         format!("'{}'", path.replace('\'', "'\"'\"'"))
     );
-    let mut child = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-T", host, "--", &script])
+    let mut command = Command::new("ssh");
+    configure_multiplexed_ssh(&mut command);
+    let mut child = command
+        .args(["-T", host, "--", &script])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -2676,6 +2702,7 @@ fn update_ssh_profile(
         .iter()
         .position(|profile| profile.id == id)
         .ok_or("SSH profile not found.")?;
+    let old_host = store.data.ssh_profiles[position].host.clone();
     let host_changed = store.data.ssh_profiles[position].host != host;
     if store.data.ssh_profiles[position].host != host
         && store.data.projects.iter().any(|project| {
@@ -2705,6 +2732,8 @@ fn update_ssh_profile(
                 let _ = forward.child.wait();
             }
         }
+        drop(forwards);
+        close_ssh_master(&old_host);
     }
     Ok(updated)
 }
@@ -3386,12 +3415,12 @@ fn ensure_remote_forward(
         .port();
     drop(listener);
     let forwarding = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
-    let mut child = Command::new("ssh")
+    let mut command = Command::new("ssh");
+    configure_multiplexed_ssh(&mut command);
+    let mut child = command
         .args([
             "-N",
             "-T",
-            "-o",
-            "BatchMode=yes",
             "-o",
             "ExitOnForwardFailure=yes",
             "-o",
@@ -4441,6 +4470,12 @@ fn attach_terminal(
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPersist=120",
+                "-o",
+                &format!("ControlPath={}", ssh_control_path()),
                 host,
                 "--",
                 &remote,
@@ -4743,6 +4778,11 @@ pub fn run() {
                     for (_, mut forward) in forwards.drain() {
                         let _ = forward.child.kill();
                         let _ = forward.child.wait();
+                    }
+                }
+                if let Ok(store) = state.store.lock() {
+                    for profile in &store.data.ssh_profiles {
+                        close_ssh_master(&profile.host);
                     }
                 }
                 return;
@@ -5569,6 +5609,9 @@ sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeo
         assert!(capture_pane_on(&target, &window).contains("remote-ready"));
         kill_session_on(&target, &window.session_name);
         let _ = target_output(&target, "rm", &["-rf", &root]);
+        if let ExecutionTarget::Ssh { host, .. } = &target {
+            close_ssh_master(host);
+        }
     }
 
 

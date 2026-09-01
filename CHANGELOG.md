@@ -15,6 +15,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 - Full remote workspaces through persisted OpenSSH Host profiles, including remote tmux terminals, Git operations, repository browsing, Docker and process discovery, automatic loopback port forwarding, connection tests, and VS Code/Cursor remote launch.
 - Remote directory browser for project and window working directories, with parent navigation and selection inside the project dialog.
 
+### Changed
+
+- Remote commands reuse a per-application OpenSSH ControlMaster connection, remote status polling is less aggressive, and hidden Apps discovery no longer blocks initial rendering.
+
 ### Fixed
 
 - Fall back to software rendering automatically when no `/dev/dri` render node is present, so the app no longer hangs with an invisible window when a WSLg host's GPU passthrough (`dxgkrnl`) is stuck. Documented the underlying WSL glitch and the `wsl --shutdown` fix in the README.
